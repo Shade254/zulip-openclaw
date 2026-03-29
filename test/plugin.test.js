@@ -7,7 +7,10 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { zulipPlugin, zulipApi, zulipUpload } = require('../plugin');
+const {
+  zulipPlugin, zulipApi, zulipUpload,
+  resolvePersonaForMessage, fetchThreadContext, handleInboundMessage, setPluginRuntime,
+} = require('../plugin');
 
 // ============================================
 // UNIT TESTS - Pure functions, no network
@@ -615,5 +618,466 @@ describe('Mock Tests', () => {
       const body = new URLSearchParams(sendOpts.body);
       expect(body.get('content')).toBe('(media)');
     });
+  });
+});
+
+// ============================================
+// resolvePersonaForMessage
+// ============================================
+
+describe('resolvePersonaForMessage', () => {
+  const config = {
+    streams: {
+      'general': ['ember', 'sage'],
+      'solo': ['sage'],
+      '*': ['ember'],
+    },
+    personas: {
+      ember: { triggers: ['@ember', 'ember'], file: 'ember.md' },
+      sage: { triggers: ['@sage', 'sage'], file: 'sage.md' },
+    },
+  };
+
+  test('returns null when config is null', () => {
+    expect(resolvePersonaForMessage(null, 'general', 'hello')).toBeNull();
+  });
+
+  test('returns null when config is undefined', () => {
+    expect(resolvePersonaForMessage(undefined, 'general', 'hello')).toBeNull();
+  });
+
+  test('returns null when stream has no personas configured', () => {
+    const cfg = { streams: { 'general': [] }, personas: {} };
+    expect(resolvePersonaForMessage(cfg, 'general', 'hello')).toBeNull();
+  });
+
+  test('returns null when stream is missing from config and no wildcard', () => {
+    const cfg = { streams: {}, personas: {} };
+    expect(resolvePersonaForMessage(cfg, 'unknown', 'hello')).toBeNull();
+  });
+
+  test('returns the single persona when only one is configured', () => {
+    expect(resolvePersonaForMessage(config, 'solo', 'hello there')).toBe('sage');
+  });
+
+  test('returns persona matching trigger in message text', () => {
+    expect(resolvePersonaForMessage(config, 'general', '@sage can you help?')).toBe('sage');
+  });
+
+  test('trigger matching is case-insensitive', () => {
+    expect(resolvePersonaForMessage(config, 'general', '@SAGE please help')).toBe('sage');
+  });
+
+  test('only checks first 50 characters for triggers', () => {
+    // Trigger starting at char 45 — fits within the 50-char window
+    const short = 'x'.repeat(45) + '@sage';
+    expect(resolvePersonaForMessage(config, 'general', short)).toBe('sage');
+
+    // Trigger starting at char 50 — falls outside the window
+    const long = 'x'.repeat(50) + '@sage';
+    expect(resolvePersonaForMessage(config, 'general', long)).toBe('ember');
+  });
+
+  test('falls back to first configured persona when no trigger match', () => {
+    expect(resolvePersonaForMessage(config, 'general', 'no trigger here')).toBe('ember');
+  });
+
+  test('fallback returns first persona, not hardcoded ember', () => {
+    const cfg = {
+      streams: { 'general': ['alice', 'bob'] },
+      personas: { alice: { triggers: ['@alice'] }, bob: { triggers: ['@bob'] } },
+    };
+    expect(resolvePersonaForMessage(cfg, 'general', 'hello')).toBe('alice');
+  });
+
+  test('does not crash when config has no streams key', () => {
+    expect(resolvePersonaForMessage({ personas: {} }, 'general', 'hello')).toBeNull();
+  });
+
+  test('does not crash when persona has no triggers', () => {
+    const cfg = {
+      streams: { 'general': ['ember', 'sage'] },
+      personas: { ember: {}, sage: { triggers: ['@sage'] } },
+    };
+    expect(resolvePersonaForMessage(cfg, 'general', 'hello')).toBe('ember');
+  });
+
+  test('does not crash when messageText is undefined', () => {
+    expect(resolvePersonaForMessage(config, 'general', undefined)).toBe('ember');
+  });
+
+  test('uses wildcard stream config for unknown streams', () => {
+    expect(resolvePersonaForMessage(config, 'random-stream', 'hello')).toBe('ember');
+  });
+});
+
+// ============================================
+// fetchThreadContext
+// ============================================
+
+describe('fetchThreadContext', () => {
+  const originalFetch = global.fetch;
+  const creds = { email: 'bot@example.com', apiKey: 'test-key', site: 'https://z.example.com' };
+
+  beforeEach(() => {
+    global.fetch = jest.fn();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  test('returns formatted context for stream messages', async () => {
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({
+        result: 'success',
+        messages: [
+          { id: 10, sender_id: 99, sender_full_name: 'Alice', content: '<p>Hello</p>', reactions: [] },
+          { id: 11, sender_id: 42, sender_full_name: 'Bot', content: '<p>Hi there</p>', reactions: [] },
+        ],
+      }),
+    });
+
+    const msg = { id: 12, type: 'stream', display_recipient: 'general', subject: 'greetings', sender_email: 'alice@example.com' };
+    const result = await fetchThreadContext(creds, msg, 42);
+
+    expect(result).toContain('Recent messages in #general > greetings:');
+    expect(result).toContain('[Alice] (id:10) Hello');
+    expect(result).toContain('[(bot)] (id:11) Hi there');
+  });
+
+  test('returns formatted context for private messages', async () => {
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({
+        result: 'success',
+        messages: [
+          { id: 20, sender_id: 99, sender_full_name: 'Bob', content: '<p>Hey</p>', reactions: [] },
+        ],
+      }),
+    });
+
+    const msg = { id: 21, type: 'private', sender_email: 'bob@example.com' };
+    const result = await fetchThreadContext(creds, msg, 42);
+
+    expect(result).toContain('Recent DM history:');
+    expect(result).toContain('[Bob] (id:20) Hey');
+  });
+
+  test('includes reaction info in formatted output', async () => {
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({
+        result: 'success',
+        messages: [
+          { id: 30, sender_id: 99, sender_full_name: 'Alice', content: '<p>Nice</p>',
+            reactions: [{ emoji_name: 'thumbs_up' }, { emoji_name: 'heart' }] },
+        ],
+      }),
+    });
+
+    const msg = { id: 31, type: 'stream', display_recipient: 'general', subject: 'topic' };
+    const result = await fetchThreadContext(creds, msg, 42);
+
+    expect(result).toContain('[reacts: thumbs_up, heart]');
+  });
+
+  test('returns undefined when API returns no messages', async () => {
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', messages: [] }),
+    });
+
+    const msg = { id: 40, type: 'stream', display_recipient: 'empty', subject: 'topic' };
+    const result = await fetchThreadContext(creds, msg, 42);
+
+    expect(result).toBeUndefined();
+  });
+
+  test('returns undefined when API result is not success', async () => {
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'error', msg: 'bad queue' }),
+    });
+
+    const msg = { id: 50, type: 'stream', display_recipient: 'general', subject: 'topic' };
+    const result = await fetchThreadContext(creds, msg, 42);
+
+    expect(result).toBeUndefined();
+  });
+
+  test('narrows by stream and topic for stream messages', async () => {
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', messages: [] }),
+    });
+
+    const msg = { id: 60, type: 'stream', display_recipient: 'engineering', subject: 'deploy' };
+    await fetchThreadContext(creds, msg, 42);
+
+    const [url] = global.fetch.mock.calls[0];
+    const narrow = JSON.parse(new URL(url).searchParams.get('narrow'));
+    expect(narrow).toEqual([
+      { operator: 'stream', operand: 'engineering' },
+      { operator: 'topic', operand: 'deploy' },
+    ]);
+  });
+
+  test('narrows by DM participants for private messages', async () => {
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', messages: [] }),
+    });
+
+    const msg = { id: 70, type: 'private', sender_email: 'alice@example.com' };
+    await fetchThreadContext(creds, msg, 42);
+
+    const [url] = global.fetch.mock.calls[0];
+    const narrow = JSON.parse(new URL(url).searchParams.get('narrow'));
+    expect(narrow).toEqual([
+      { operator: 'dm', operand: ['bot@example.com', 'alice@example.com'] },
+    ]);
+  });
+});
+
+// ============================================
+// handleInboundMessage
+// ============================================
+
+describe('handleInboundMessage', () => {
+  const originalFetch = global.fetch;
+  const creds = { email: 'bot@example.com', apiKey: 'test-key', site: 'https://z.example.com' };
+  const account = { accountId: 'default', email: 'bot@example.com' };
+  const myUserId = 42;
+
+  let capturedDispatchArgs;
+  let deliverFn;
+
+  const fakeRuntime = {
+    config: { loadConfig: () => ({}) },
+    channel: {
+      routing: {
+        resolveAgentRoute: () => ({ sessionKey: 'sk-123', accountId: 'acc-1' }),
+      },
+      reply: {
+        finalizeInboundContext: (x) => x,
+        dispatchReplyWithBufferedBlockDispatcher: async (args) => {
+          capturedDispatchArgs = args;
+          deliverFn = args.dispatcherOptions.deliver;
+        },
+      },
+    },
+  };
+
+  beforeEach(() => {
+    capturedDispatchArgs = null;
+    deliverFn = null;
+    setPluginRuntime(fakeRuntime);
+    global.fetch = jest.fn();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  function mockFetchThreadContext() {
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', messages: [] }),
+    });
+  }
+
+  test('stream message builds correct inbound context shape', async () => {
+    mockFetchThreadContext();
+    const msg = {
+      id: 100, type: 'stream', display_recipient: 'general', subject: 'greetings',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: '<p>Hello bot</p>', timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    const ctx = capturedDispatchArgs.ctx;
+    expect(ctx.ChatType).toBe('group');
+    expect(ctx.From).toBe('zulip:general');
+    expect(ctx.ThreadId).toBe('greetings');
+    expect(ctx.GroupSubject).toBe('general');
+    expect(ctx.Body).toBe('Hello bot');
+    expect(ctx.SenderName).toBe('Alice');
+    expect(ctx.SessionKey).toBe('sk-123');
+    expect(ctx.AccountId).toBe('acc-1');
+    expect(ctx.Provider).toBe('zulip-openclaw');
+  });
+
+  test('private message builds correct inbound context shape', async () => {
+    mockFetchThreadContext();
+    const msg = {
+      id: 200, type: 'private', display_recipient: [{ email: 'alice@example.com' }],
+      subject: '', sender_full_name: 'Alice', sender_id: 99,
+      sender_email: 'alice@example.com', content: '<p>DM hello</p>', timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    const ctx = capturedDispatchArgs.ctx;
+    expect(ctx.ChatType).toBe('direct');
+    expect(ctx.From).toBe('zulip:99');
+    expect(ctx.ThreadId).toBeUndefined();
+    expect(ctx.GroupSubject).toBeUndefined();
+  });
+
+  test('resolveAgentRoute receives channel peer for stream messages', async () => {
+    const resolveAgentRoute = jest.fn(() => ({ sessionKey: 'sk', accountId: 'acc' }));
+    setPluginRuntime({
+      ...fakeRuntime,
+      channel: {
+        ...fakeRuntime.channel,
+        routing: { resolveAgentRoute },
+        reply: fakeRuntime.channel.reply,
+      },
+    });
+    mockFetchThreadContext();
+
+    const msg = {
+      id: 300, type: 'stream', display_recipient: 'dev', subject: 'ci',
+      sender_full_name: 'Bob', sender_id: 88, sender_email: 'bob@example.com',
+      content: '<p>test</p>', timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    expect(resolveAgentRoute).toHaveBeenCalledWith(expect.objectContaining({
+      peer: { kind: 'channel', id: 'dev:ci' },
+    }));
+  });
+
+  test('resolveAgentRoute receives direct peer for private messages', async () => {
+    const resolveAgentRoute = jest.fn(() => ({ sessionKey: 'sk', accountId: 'acc' }));
+    setPluginRuntime({
+      ...fakeRuntime,
+      channel: {
+        ...fakeRuntime.channel,
+        routing: { resolveAgentRoute },
+        reply: fakeRuntime.channel.reply,
+      },
+    });
+    mockFetchThreadContext();
+
+    const msg = {
+      id: 400, type: 'private', display_recipient: [],
+      subject: '', sender_full_name: 'Carol', sender_id: 77,
+      sender_email: 'carol@example.com', content: '<p>hi</p>', timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    expect(resolveAgentRoute).toHaveBeenCalledWith(expect.objectContaining({
+      peer: { kind: 'direct', id: '77' },
+    }));
+  });
+
+  test('deliver callback sends reply via zulipApi for stream messages', async () => {
+    mockFetchThreadContext();
+
+    const msg = {
+      id: 500, type: 'stream', display_recipient: 'general', subject: 'test',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: '<p>hi</p>', timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', id: 501 }),
+    });
+
+    await deliverFn('Hello back!');
+
+    const lastCall = global.fetch.mock.calls[global.fetch.mock.calls.length - 1];
+    const body = new URLSearchParams(lastCall[1].body);
+    expect(body.get('type')).toBe('stream');
+    expect(body.get('to')).toBe('general');
+    expect(body.get('topic')).toBe('test');
+    expect(body.get('content')).toBe('Hello back!');
+  });
+
+  test('deliver callback sends private reply correctly', async () => {
+    mockFetchThreadContext();
+
+    const msg = {
+      id: 600, type: 'private', display_recipient: [],
+      subject: '', sender_full_name: 'Bob', sender_id: 88,
+      sender_email: 'bob@example.com', content: '<p>hi</p>', timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', id: 601 }),
+    });
+
+    await deliverFn('DM reply');
+
+    const lastCall = global.fetch.mock.calls[global.fetch.mock.calls.length - 1];
+    const body = new URLSearchParams(lastCall[1].body);
+    expect(body.get('type')).toBe('private');
+    expect(body.get('to')).toBe('bob@example.com');
+    expect(body.get('content')).toBe('DM reply');
+  });
+
+  test('deliver callback does not send when payload is empty', async () => {
+    mockFetchThreadContext();
+
+    const msg = {
+      id: 700, type: 'stream', display_recipient: 'general', subject: 'test',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: '<p>hi</p>', timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    const callCountBefore = global.fetch.mock.calls.length;
+    await deliverFn('');
+    expect(global.fetch.mock.calls.length).toBe(callCountBefore);
+  });
+
+  test('does not crash when msg.content is undefined', async () => {
+    mockFetchThreadContext();
+    const msg = {
+      id: 750, type: 'stream', display_recipient: 'general', subject: 'test',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: undefined, timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    const ctx = capturedDispatchArgs.ctx;
+    expect(ctx.Body).toBe('');
+  });
+
+  test('deliver handles payload object with body property', async () => {
+    mockFetchThreadContext();
+
+    const msg = {
+      id: 800, type: 'stream', display_recipient: 'general', subject: 'test',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: '<p>hi</p>', timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', id: 801 }),
+    });
+
+    await deliverFn({ body: 'object payload' });
+
+    const lastCall = global.fetch.mock.calls[global.fetch.mock.calls.length - 1];
+    const body = new URLSearchParams(lastCall[1].body);
+    expect(body.get('content')).toBe('object payload');
   });
 });

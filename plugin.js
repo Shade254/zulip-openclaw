@@ -62,7 +62,7 @@ function loadPersonasConfig() {
 }
 
 function resolvePersonaForMessage(config, streamName, messageText) {
-  if (!config) return null;
+  if (!config?.streams) return null;
 
   // Get available personas for this stream (or default)
   const streamPersonas = config.streams[streamName] ?? config.streams['*'] ?? [];
@@ -74,10 +74,10 @@ function resolvePersonaForMessage(config, streamName, messageText) {
   }
 
   // Check message for persona triggers
-  const messageStart = messageText.slice(0, 50).toLowerCase();
+  const messageStart = (messageText ?? '').slice(0, 50).toLowerCase();
   for (const personaId of streamPersonas) {
-    const persona = config.personas[personaId];
-    if (!persona) continue;
+    const persona = config.personas?.[personaId];
+    if (!persona?.triggers) continue;
 
     for (const trigger of persona.triggers) {
       if (messageStart.includes(trigger.toLowerCase())) {
@@ -86,8 +86,8 @@ function resolvePersonaForMessage(config, streamName, messageText) {
     }
   }
 
-  // Default to Ember if no match
-  return 'ember';
+  // Default to first configured persona when no trigger matches
+  return streamPersonas[0];
 }
 
 function loadPersonaContent(config, personaId) {
@@ -288,6 +288,159 @@ async function zulipUpload(creds, source) {
   if (result.result !== 'success') throw new Error(`Zulip upload failed: ${result.msg}`);
 
   return { ok: true, uri: result.uri ?? result.url, filename };
+}
+
+// --- Gateway Helpers ---
+
+const CONTEXT_LIMIT = 15;
+
+async function fetchThreadContext(creds, msg, myUserId) {
+  const isStream = msg.type === 'stream';
+  const contextNarrow = [];
+  if (isStream) {
+    contextNarrow.push({ operator: 'stream', operand: msg.display_recipient });
+    contextNarrow.push({ operator: 'topic', operand: msg.subject });
+  } else {
+    contextNarrow.push({ operator: 'dm', operand: [creds.email, msg.sender_email] });
+  }
+
+  const contextQs = new URLSearchParams({
+    narrow: JSON.stringify(contextNarrow),
+    num_before: String(CONTEXT_LIMIT),
+    num_after: '0',
+    anchor: String(msg.id),
+  }).toString();
+
+  const contextResult = await zulipApi(creds, `/messages?${contextQs}`);
+  if (contextResult.result !== 'success' || !contextResult.messages?.length) {
+    return undefined;
+  }
+
+  const formatted = contextResult.messages.map(m => {
+    const name = m.sender_id === myUserId ? '(bot)' : m.sender_full_name;
+    const content = m.content.replace(/<[^>]*>/g, '');
+    const reactions = (m.reactions ?? []).map(r => r.emoji_name);
+    const reactStr = reactions.length > 0 ? ` [reacts: ${reactions.join(', ')}]` : '';
+    return `[${name}] (id:${m.id}) ${content}${reactStr}`;
+  }).join('\n');
+
+  const label = isStream
+    ? `Recent messages in #${msg.display_recipient} > ${msg.subject}`
+    : `Recent DM history`;
+  return `${label}:\n${formatted}`;
+}
+
+async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
+  const isStream = msg.type === 'stream';
+  const chatId = isStream
+    ? `stream:${msg.display_recipient}`
+    : `private:${msg.sender_email}`;
+  const from = isStream
+    ? `zulip:${msg.display_recipient}`
+    : `zulip:${msg.sender_id}`;
+  const text = (msg.content ?? '').replace(/<[^>]*>/g, '');
+
+  ctx.log?.info?.(`[zulip] Received message from ${msg.sender_full_name} in ${chatId}`);
+
+  // Fetch recent topic/DM context for ThreadStarterBody
+  let threadStarterBody;
+  try {
+    threadStarterBody = await fetchThreadContext(creds, msg, myUserId);
+  } catch (err) {
+    if (err instanceof RateLimitError) {
+      ctx.log?.warn?.(`[zulip] Rate limited fetching context, waiting ${err.retryAfterMs / 1000}s`);
+      await new Promise(r => setTimeout(r, err.retryAfterMs));
+    } else {
+      ctx.log?.warn?.(`[zulip] Failed to fetch context: ${err.message}`);
+    }
+  }
+
+  // Resolve persona for this message (if config exists)
+  let personaContent = null;
+  let personaDisplayName = null;
+  const personasConfig = loadPersonasConfig();
+  if (personasConfig && isStream) {
+    const personaId = resolvePersonaForMessage(personasConfig, msg.display_recipient, text);
+    if (personaId) {
+      personaContent = loadPersonaContent(personasConfig, personaId);
+      if (personaContent) {
+        const persona = personasConfig.personas[personaId];
+        personaDisplayName = persona?.triggers?.[0] ?? personaId;
+        ctx.log?.info?.(`[zulip] Using persona: ${personaDisplayName}`);
+      }
+    }
+  }
+
+  // Dispatch through OpenClaw's inbound message system
+  const runtime = getPluginRuntime();
+  const cfg = runtime.config.loadConfig();
+
+  const peer = isStream
+    ? { kind: 'channel', id: `${msg.display_recipient}:${msg.subject}` }
+    : { kind: 'direct', id: String(msg.sender_id) };
+  const route = runtime.channel.routing.resolveAgentRoute({
+    channel: 'zulip-openclaw',
+    accountId: account.accountId,
+    peer,
+    cfg,
+  });
+
+  let fullThreadStarterBody = threadStarterBody;
+  if (personaContent) {
+    const personaSection = `You are responding as this persona:\n---\n${personaContent}\n---\n\nDo not prefix your response with your name — the system will add it automatically.\n\n`;
+    fullThreadStarterBody = personaSection + (threadStarterBody ?? '');
+  }
+
+  const inboundCtx = runtime.channel.reply.finalizeInboundContext({
+    Body: text,
+    RawBody: text,
+    From: from,
+    To: `zulip:${account.email}`,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
+    ChatType: isStream ? 'group' : 'direct',
+    SenderName: msg.sender_full_name,
+    SenderId: String(msg.sender_id),
+    SenderUsername: msg.sender_email,
+    Provider: 'zulip-openclaw',
+    Surface: 'zulip',
+    MessageSid: String(msg.id),
+    Timestamp: msg.timestamp * 1000,
+    ThreadId: isStream ? msg.subject : undefined,
+    GroupSubject: isStream ? msg.display_recipient : undefined,
+    CommandAuthorized: true,
+    ThreadStarterBody: fullThreadStarterBody,
+  });
+
+  const replyTarget = isStream ? msg.display_recipient : msg.sender_email;
+  const replyType = isStream ? 'stream' : 'private';
+  const replyTopic = isStream ? msg.subject : undefined;
+
+  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: inboundCtx,
+    cfg,
+    dispatcherOptions: {
+      deliver: async (payload) => {
+        let replyText = typeof payload === 'string' ? payload : (payload.body ?? payload.text ?? '');
+        if (!replyText) return;
+
+        if (personaDisplayName) {
+          replyText = `[${personaDisplayName}] ${replyText}`;
+        }
+
+        const data = { type: replyType, to: replyTarget, content: replyText };
+        if (replyTopic) data.topic = replyTopic;
+
+        const sendResult = await zulipApi(creds, '/messages', 'POST', data);
+        if (sendResult.result !== 'success') {
+          ctx.log?.error?.(`[zulip] Failed to send reply: ${sendResult.msg}`);
+        }
+      },
+      onError: (err) => {
+        ctx.log?.error?.(`[zulip] Dispatch error: ${String(err)}`);
+      },
+    },
+  });
 }
 
 // --- Channel Plugin Definition ---
@@ -606,152 +759,8 @@ const zulipPlugin = {
                 const msg = event.message;
                 if (msg.sender_id === myUserId) continue;
 
-                const isStream = msg.type === 'stream';
-                const chatId = isStream
-                  ? `stream:${msg.display_recipient}`
-                  : `private:${msg.sender_email}`;
-                const from = isStream
-                  ? `zulip:${msg.display_recipient}`
-                  : `zulip:${msg.sender_id}`;
-                const text = msg.content.replace(/<[^>]*>/g, '');
-
-                ctx.log?.info?.(`[zulip] Received message from ${msg.sender_full_name} in ${chatId}`);
-
-                // Fetch recent topic/DM context for ThreadStarterBody
-                let threadStarterBody;
                 try {
-                  const contextNarrow = [];
-                  if (isStream) {
-                    contextNarrow.push({ operator: 'stream', operand: msg.display_recipient });
-                    contextNarrow.push({ operator: 'topic', operand: msg.subject });
-                  } else {
-                    contextNarrow.push({ operator: 'dm', operand: [creds.email, msg.sender_email] });
-                  }
-
-                  const CONTEXT_LIMIT = 15;
-                  const contextQs = new URLSearchParams({
-                    narrow: JSON.stringify(contextNarrow),
-                    num_before: String(CONTEXT_LIMIT),
-                    num_after: '0',
-                    anchor: String(msg.id),
-                  }).toString();
-
-                  const contextResult = await zulipApi(creds, `/messages?${contextQs}`);
-                  if (contextResult.result === 'success' && contextResult.messages?.length > 0) {
-                    const formatted = contextResult.messages.map(m => {
-                      const name = m.sender_id === myUserId ? '(bot)' : m.sender_full_name;
-                      const content = m.content.replace(/<[^>]*>/g, '');
-                      const reactions = (m.reactions ?? []).map(r => r.emoji_name);
-                      const reactStr = reactions.length > 0 ? ` [reacts: ${reactions.join(', ')}]` : '';
-                      return `[${name}] (id:${m.id}) ${content}${reactStr}`;
-                    }).join('\n');
-                    const label = isStream
-                      ? `Recent messages in #${msg.display_recipient} > ${msg.subject}`
-                      : `Recent DM history`;
-                    threadStarterBody = `${label}:\n${formatted}`;
-                  }
-                } catch (err) {
-                  if (err instanceof RateLimitError) {
-                    ctx.log?.warn?.(`[zulip] Rate limited fetching context, waiting ${err.retryAfterMs / 1000}s`);
-                    await new Promise(r => setTimeout(r, err.retryAfterMs));
-                  } else {
-                    ctx.log?.warn?.(`[zulip] Failed to fetch context: ${err.message}`);
-                  }
-                }
-
-                // Resolve persona for this message (if config exists)
-                let personaContent = null;
-                let personaDisplayName = null;
-                const personasConfig = loadPersonasConfig();
-                if (personasConfig && isStream) {
-                  const personaId = resolvePersonaForMessage(personasConfig, msg.display_recipient, text);
-                  if (personaId) {
-                    personaContent = loadPersonaContent(personasConfig, personaId);
-                    if (personaContent) {
-                      // Get display name from first trigger (capitalized)
-                      const persona = personasConfig.personas[personaId];
-                      personaDisplayName = persona?.triggers?.[0] ?? personaId;
-                      ctx.log?.info?.(`[zulip] Using persona: ${personaDisplayName}`);
-                    }
-                  }
-                }
-
-                // Dispatch through OpenClaw's inbound message system
-                try {
-                  const runtime = getPluginRuntime();
-                  const cfg = runtime.config.loadConfig();
-
-                  // Resolve agent route for this message
-                  const peer = isStream
-                    ? { kind: 'channel', id: `${msg.display_recipient}:${msg.subject}` }
-                    : { kind: 'direct', id: String(msg.sender_id) };
-                  const route = runtime.channel.routing.resolveAgentRoute({
-                    channel: 'zulip-openclaw',
-                    accountId: account.accountId,
-                    peer,
-                    cfg,
-                  });
-
-                  // Build inbound context (matching OpenClaw's expected shape)
-                  // Prepend persona content to thread starter body if available
-                  let fullThreadStarterBody = threadStarterBody;
-                  if (personaContent) {
-                    const personaSection = `You are responding as this persona:\n---\n${personaContent}\n---\n\nDo not prefix your response with your name — the system will add it automatically.\n\n`;
-                    fullThreadStarterBody = personaSection + (threadStarterBody ?? '');
-                  }
-
-                  const inboundCtx = runtime.channel.reply.finalizeInboundContext({
-                    Body: text,
-                    RawBody: text,
-                    From: from,
-                    To: `zulip:${account.email}`,
-                    SessionKey: route.sessionKey,
-                    AccountId: route.accountId,
-                    ChatType: isStream ? 'group' : 'direct',
-                    SenderName: msg.sender_full_name,
-                    SenderId: String(msg.sender_id),
-                    SenderUsername: msg.sender_email,
-                    Provider: 'zulip-openclaw',
-                    Surface: 'zulip',
-                    MessageSid: String(msg.id),
-                    Timestamp: msg.timestamp * 1000,
-                    ThreadId: isStream ? msg.subject : undefined,
-                    GroupSubject: isStream ? msg.display_recipient : undefined,
-                    CommandAuthorized: true,
-                    ThreadStarterBody: fullThreadStarterBody,
-                  });
-
-                  // Send reply back to Zulip
-                  const replyTarget = isStream ? msg.display_recipient : msg.sender_email;
-                  const replyType = isStream ? 'stream' : 'private';
-                  const replyTopic = isStream ? msg.subject : undefined;
-
-                  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-                    ctx: inboundCtx,
-                    cfg,
-                    dispatcherOptions: {
-                      deliver: async (payload) => {
-                        let replyText = typeof payload === 'string' ? payload : (payload.body ?? payload.text ?? '');
-                        if (!replyText) return;
-
-                        // Prefix with persona name if available
-                        if (personaDisplayName) {
-                          replyText = `[${personaDisplayName}] ${replyText}`;
-                        }
-
-                        const data = { type: replyType, to: replyTarget, content: replyText };
-                        if (replyTopic) data.topic = replyTopic;
-
-                        const sendResult = await zulipApi(creds, '/messages', 'POST', data);
-                        if (sendResult.result !== 'success') {
-                          ctx.log?.error?.(`[zulip] Failed to send reply: ${sendResult.msg}`);
-                        }
-                      },
-                      onError: (err) => {
-                        ctx.log?.error?.(`[zulip] Dispatch error: ${String(err)}`);
-                      },
-                    },
-                  });
+                  await handleInboundMessage(ctx, creds, account, msg, myUserId);
                 } catch (dispatchErr) {
                   if (dispatchErr instanceof RateLimitError) {
                     ctx.log?.warn?.(`[zulip] Rate limited during dispatch, waiting ${dispatchErr.retryAfterMs / 1000}s`);
@@ -803,4 +812,9 @@ const zulipPlugin = {
 
 // --- Export & Registration ---
 
-module.exports = { zulipPlugin, zulipApi, zulipUpload, loadCredentials, setPluginRuntime, RateLimitError };
+module.exports = {
+  zulipPlugin, zulipApi, zulipUpload, loadCredentials, setPluginRuntime, RateLimitError,
+  // Exported for direct unit testing
+  resolveMessageTarget, createMessagePayload, guessMimeType, sanitizeFilename,
+  makeAttachmentLink, resolvePersonaForMessage, fetchThreadContext, handleInboundMessage,
+};

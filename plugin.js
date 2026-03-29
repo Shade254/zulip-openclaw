@@ -164,7 +164,10 @@ function createUploadBoundary() {
 }
 
 function sanitizeFilename(filename) {
-  return filename.replace(/["\r\n]/g, '_');
+  // Strip characters that break multipart Content-Disposition headers
+  // or cause issues in downstream file handling: quotes, CRLF, control
+  // characters (including null bytes), and backslashes.
+  return filename.replace(/["\r\n\\\x00-\x1f\x7f]/g, '_');
 }
 
 async function assertLocalFileWithinLimit(source) {

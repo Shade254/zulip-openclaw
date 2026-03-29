@@ -669,8 +669,13 @@ describe('resolvePersonaForMessage', () => {
   });
 
   test('only checks first 50 characters for triggers', () => {
-    const padding = 'x'.repeat(50);
-    expect(resolvePersonaForMessage(config, 'general', padding + '@sage')).toBe('ember');
+    // Trigger starting at char 45 — fits within the 50-char window
+    const short = 'x'.repeat(45) + '@sage';
+    expect(resolvePersonaForMessage(config, 'general', short)).toBe('sage');
+
+    // Trigger starting at char 50 — falls outside the window
+    const long = 'x'.repeat(50) + '@sage';
+    expect(resolvePersonaForMessage(config, 'general', long)).toBe('ember');
   });
 
   test('falls back to first configured persona when no trigger match', () => {
@@ -874,7 +879,6 @@ describe('handleInboundMessage', () => {
 
   afterEach(() => {
     global.fetch = originalFetch;
-    setPluginRuntime(null);
   });
 
   function mockFetchThreadContext() {

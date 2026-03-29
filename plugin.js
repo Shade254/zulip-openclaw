@@ -815,6 +815,5 @@ const zulipPlugin = {
 module.exports = {
   zulipPlugin, zulipApi, zulipUpload, loadCredentials, setPluginRuntime, RateLimitError,
   // Exported for direct unit testing
-  resolveMessageTarget, createMessagePayload, guessMimeType, sanitizeFilename,
-  makeAttachmentLink, resolvePersonaForMessage, fetchThreadContext, handleInboundMessage,
+  resolvePersonaForMessage, fetchThreadContext, handleInboundMessage,
 };

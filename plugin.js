@@ -6,7 +6,7 @@
  */
 
 const { readFileSync, existsSync } = require('fs');
-const { join } = require('path');
+const { join, extname, basename } = require('path');
 const { homedir } = require('os');
 
 const { version } = require('./package.json');
@@ -110,6 +110,26 @@ function loadPersonaContent(config, personaId) {
   }
 }
 
+// --- MIME helpers ---
+
+const MIME_MAP = {
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif':  'image/gif',
+  '.webp': 'image/webp',
+  '.mp4':  'video/mp4',
+  '.mp3':  'audio/mpeg',
+  '.ogg':  'audio/ogg',
+  '.pdf':  'application/pdf',
+  '.txt':  'text/plain',
+};
+
+function guessMimeType(filename) {
+  const ext = extname(filename).toLowerCase();
+  return MIME_MAP[ext] || 'application/octet-stream';
+}
+
 // --- API Client ---
 
 class RateLimitError extends Error {
@@ -151,6 +171,78 @@ async function zulipApi(creds, endpoint, method = 'GET', data, opts = {}) {
   }
 
   return response.json();
+}
+
+// --- File Upload ---
+
+/**
+ * Upload a file to Zulip's /user_uploads endpoint.
+ *
+ * Accepts either a local file path or an http(s) URL (fetched first).
+ * Returns { ok: true, uri, filename } on success, or throws on failure.
+ *
+ * The returned `uri` is relative (e.g. `/user_uploads/1/abc/file.png`).
+ * Build the full link as: `[filename](${creds.site}${uri})`
+ */
+async function zulipUpload(creds, source) {
+  let buffer;
+  let filename;
+  let mimeType;
+
+  if (source.startsWith('http://') || source.startsWith('https://')) {
+    const response = await fetch(source);
+    if (!response.ok) throw new Error(`Failed to fetch media URL: ${response.status}`);
+    buffer = Buffer.from(await response.arrayBuffer());
+    filename = basename(new URL(source).pathname) || 'upload';
+    // Prefer Content-Type from server; fall back to extension-based guess
+    mimeType = response.headers.get('content-type')?.split(';')[0].trim() || guessMimeType(filename);
+  } else {
+    if (!existsSync(source)) throw new Error(`File not found: ${source}`);
+    buffer = readFileSync(source);
+    filename = basename(source);
+    mimeType = guessMimeType(filename);
+  }
+
+  // Build multipart/form-data manually — required because Node's native fetch
+  // (undici) does not correctly handle Buffer bodies with FormData.
+  const boundary = `----ZulipUpload${Date.now()}`;
+  const CRLF = '\r\n';
+  const head = Buffer.from(
+    `--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="files[]"; filename="${filename}"${CRLF}` +
+    `Content-Type: ${mimeType}${CRLF}${CRLF}`
+  );
+  const tail = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
+  const body = Buffer.concat([head, buffer, tail]);
+
+  const url = new URL('/api/v1/user_uploads', creds.site);
+  const auth = Buffer.from(`${creds.email}:${creds.apiKey}`).toString('base64');
+
+  const response = await fetch(url.toString(), {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'User-Agent': USER_AGENT,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': String(body.length),
+    },
+    body,
+  });
+
+  if (response.status === 429) {
+    const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
+    throw new RateLimitError(retryAfter);
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Zulip upload error ${response.status}: ${text.slice(0, 200)}`);
+  }
+
+  const result = await response.json();
+  if (result.result !== 'success') throw new Error(`Zulip upload failed: ${result.msg}`);
+
+  return { ok: true, uri: result.uri ?? result.url, filename };
 }
 
 // --- Channel Plugin Definition ---
@@ -253,11 +345,53 @@ const zulipPlugin = {
       return { channel: 'zulip-openclaw', ok: false, error: result.msg };
     },
 
-    sendMedia: async ({ to, text, mediaUrl, accountId, cfg, replyToId }) => {
-      // TODO: Upload file to Zulip, then send message with attachment link
-      // For now, send text with media URL
-      const content = text ? `${text}\n${mediaUrl}` : mediaUrl;
-      return zulipPlugin.outbound.sendText({ to, text: content, accountId, cfg, replyToId });
+    sendMedia: async ({ to, text, mediaUrl, mediaUrls, accountId, cfg, replyToId }) => {
+      const account = zulipPlugin.config.resolveAccount(cfg, accountId);
+      if (!account) return { ok: false, error: 'No Zulip account configured' };
+
+      const creds = { email: account.email, apiKey: account.apiKey, site: account.site };
+
+      let type = 'private';
+      let target = to;
+      let topic = replyToId ?? 'chat';
+
+      if (to.startsWith('stream:')) {
+        type = 'stream';
+        target = to.slice(7);
+      } else if (to.startsWith('private:')) {
+        target = to.slice(8);
+      }
+
+      // Normalise single vs multiple media sources into one list
+      const sources = mediaUrls?.length > 0 ? mediaUrls : (mediaUrl ? [mediaUrl] : []);
+
+      // Upload each source and collect Zulip attachment markdown links
+      const attachmentLinks = [];
+      for (const source of sources) {
+        try {
+          const { uri, filename } = await zulipUpload(creds, source);
+          // Zulip renders attachments when the link target points to /user_uploads/...
+          attachmentLinks.push(`[${filename}](${creds.site}${uri})`);
+        } catch (err) {
+          console.warn(`[zulip] sendMedia upload failed for ${source}: ${err.message}`);
+          // Graceful fallback: include raw URL rather than dropping the media
+          attachmentLinks.push(source);
+        }
+      }
+
+      const parts = [];
+      if (text) parts.push(text);
+      if (attachmentLinks.length > 0) parts.push(attachmentLinks.join('\n'));
+      const content = parts.join('\n') || '(media)';
+
+      const data = { type, to: target, content };
+      if (type === 'stream') data.topic = topic;
+
+      const result = await zulipApi(creds, '/messages', 'POST', data);
+      if (result.result === 'success') {
+        return { channel: 'zulip-openclaw', ok: true, messageId: String(result.id) };
+      }
+      return { channel: 'zulip-openclaw', ok: false, error: result.msg };
     },
   },
 
@@ -658,4 +792,4 @@ const zulipPlugin = {
 
 // --- Export & Registration ---
 
-module.exports = { zulipPlugin, zulipApi, loadCredentials, setPluginRuntime, RateLimitError };
+module.exports = { zulipPlugin, zulipApi, zulipUpload, loadCredentials, setPluginRuntime, RateLimitError };

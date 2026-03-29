@@ -6,11 +6,14 @@
  */
 
 const { readFileSync, existsSync } = require('fs');
+const { access, readFile, stat } = require('fs/promises');
 const { join, extname, basename } = require('path');
 const { homedir } = require('os');
 
 const { version } = require('./package.json');
 const USER_AGENT = `zulip-openclaw/${version}`;
+const MAX_UPLOAD_SIZE_MB = 25;
+const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
 
 // --- Plugin Runtime (set during registration) ---
 
@@ -130,6 +133,63 @@ function guessMimeType(filename) {
   return MIME_MAP[ext] || 'application/octet-stream';
 }
 
+function resolveMessageTarget(to, replyToId) {
+  let type = 'private';
+  let target = to;
+  let topic = replyToId ?? 'chat';
+
+  if (to.startsWith('stream:')) {
+    type = 'stream';
+    target = to.slice(7);
+  } else if (to.startsWith('private:')) {
+    target = to.slice(8);
+  }
+
+  return { type, target, topic };
+}
+
+function createMessagePayload(to, replyToId, content) {
+  const { type, target, topic } = resolveMessageTarget(to, replyToId);
+  const data = { type, to: target, content };
+  if (type === 'stream') data.topic = topic;
+  return data;
+}
+
+function makeAttachmentLink(site, filename, uri) {
+  return `[${filename}](${site}${uri})`;
+}
+
+function createUploadBoundary() {
+  return `----ZulipUpload${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function formatSourceForError(source) {
+  return source.length > 120 ? `${source.slice(0, 117)}...` : source;
+}
+
+async function assertLocalFileWithinLimit(source) {
+  await access(source);
+  const fileStat = await stat(source);
+  if (fileStat.size > MAX_UPLOAD_SIZE_BYTES) {
+    throw new Error(`File too large (${fileStat.size} bytes). Max allowed is ${MAX_UPLOAD_SIZE_MB}MB: ${formatSourceForError(source)}`);
+  }
+}
+
+function assertRemoteContentLengthWithinLimit(contentLength, source) {
+  if (!contentLength) return;
+  const parsed = Number.parseInt(contentLength, 10);
+  if (!Number.isFinite(parsed)) return;
+  if (parsed > MAX_UPLOAD_SIZE_BYTES) {
+    throw new Error(`Remote file too large (${parsed} bytes). Max allowed is ${MAX_UPLOAD_SIZE_MB}MB: ${formatSourceForError(source)}`);
+  }
+}
+
+function assertBufferedFileWithinLimit(buffer, source) {
+  if (buffer.length > MAX_UPLOAD_SIZE_BYTES) {
+    throw new Error(`Buffered file too large (${buffer.length} bytes). Max allowed is ${MAX_UPLOAD_SIZE_MB}MB: ${formatSourceForError(source)}`);
+  }
+}
+
 // --- API Client ---
 
 class RateLimitError extends Error {
@@ -185,27 +245,34 @@ async function zulipApi(creds, endpoint, method = 'GET', data, opts = {}) {
  * Build the full link as: `[filename](${creds.site}${uri})`
  */
 async function zulipUpload(creds, source) {
+  if (!source || typeof source !== 'string') {
+    throw new Error('Upload source must be a non-empty string');
+  }
+
   let buffer;
   let filename;
   let mimeType;
 
   if (source.startsWith('http://') || source.startsWith('https://')) {
     const response = await fetch(source);
-    if (!response.ok) throw new Error(`Failed to fetch media URL: ${response.status}`);
+    if (!response.ok) throw new Error(`Failed to fetch media URL (${response.status}): ${formatSourceForError(source)}`);
+    assertRemoteContentLengthWithinLimit(response.headers.get('content-length'), source);
     buffer = Buffer.from(await response.arrayBuffer());
+    assertBufferedFileWithinLimit(buffer, source);
     filename = basename(new URL(source).pathname) || 'upload';
     // Prefer Content-Type from server; fall back to extension-based guess
     mimeType = response.headers.get('content-type')?.split(';')[0].trim() || guessMimeType(filename);
   } else {
-    if (!existsSync(source)) throw new Error(`File not found: ${source}`);
-    buffer = readFileSync(source);
+    await assertLocalFileWithinLimit(source);
+    buffer = await readFile(source);
+    assertBufferedFileWithinLimit(buffer, source);
     filename = basename(source);
     mimeType = guessMimeType(filename);
   }
 
   // Build multipart/form-data manually — required because Node's native fetch
   // (undici) does not correctly handle Buffer bodies with FormData.
-  const boundary = `----ZulipUpload${Date.now()}`;
+  const boundary = createUploadBoundary();
   const CRLF = '\r\n';
   const head = Buffer.from(
     `--${boundary}${CRLF}` +
@@ -236,7 +303,7 @@ async function zulipUpload(creds, source) {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Zulip upload error ${response.status}: ${text.slice(0, 200)}`);
+    throw new Error(`Zulip upload error ${response.status} for ${filename}: ${text.slice(0, 200)}`);
   }
 
   const result = await response.json();
@@ -323,19 +390,7 @@ const zulipPlugin = {
 
       const creds = { email: account.email, apiKey: account.apiKey, site: account.site };
 
-      let type = 'private';
-      let target = to;
-      let topic = replyToId ?? 'chat';
-
-      if (to.startsWith('stream:')) {
-        type = 'stream';
-        target = to.slice(7);
-      } else if (to.startsWith('private:')) {
-        target = to.slice(8);
-      }
-
-      const data = { type, to: target, content: text };
-      if (type === 'stream') data.topic = topic;
+      const data = createMessagePayload(to, replyToId, text);
 
       const result = await zulipApi(creds, '/messages', 'POST', data);
 
@@ -351,16 +406,6 @@ const zulipPlugin = {
 
       const creds = { email: account.email, apiKey: account.apiKey, site: account.site };
 
-      let type = 'private';
-      let target = to;
-      let topic = replyToId ?? 'chat';
-
-      if (to.startsWith('stream:')) {
-        type = 'stream';
-        target = to.slice(7);
-      } else if (to.startsWith('private:')) {
-        target = to.slice(8);
-      }
 
       // Normalise single vs multiple media sources into one list
       const sources = mediaUrls?.length > 0 ? mediaUrls : (mediaUrl ? [mediaUrl] : []);
@@ -371,7 +416,7 @@ const zulipPlugin = {
         try {
           const { uri, filename } = await zulipUpload(creds, source);
           // Zulip renders attachments when the link target points to /user_uploads/...
-          attachmentLinks.push(`[${filename}](${creds.site}${uri})`);
+          attachmentLinks.push(makeAttachmentLink(creds.site, filename, uri));
         } catch (err) {
           console.warn(`[zulip] sendMedia upload failed for ${source}: ${err.message}`);
           // Graceful fallback: include raw URL rather than dropping the media
@@ -384,8 +429,7 @@ const zulipPlugin = {
       if (attachmentLinks.length > 0) parts.push(attachmentLinks.join('\n'));
       const content = parts.join('\n') || '(media)';
 
-      const data = { type, to: target, content };
-      if (type === 'stream') data.topic = topic;
+      const data = createMessagePayload(to, replyToId, content);
 
       const result = await zulipApi(creds, '/messages', 'POST', data);
       if (result.result === 'success') {

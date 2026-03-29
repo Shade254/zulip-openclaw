@@ -416,10 +416,30 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
   const replyType = isStream ? 'stream' : 'private';
   const replyTopic = isStream ? msg.subject : undefined;
 
+  const sendTypingOp = async (op) => {
+    try {
+      const typingData = { op };
+      if (isStream) {
+        typingData.type = 'stream';
+        typingData.stream_id = msg.stream_id;
+        typingData.topic = msg.subject;
+      } else {
+        typingData.type = 'direct';
+        typingData.to = JSON.stringify([msg.sender_id]);
+      }
+      await zulipApi(creds, '/typing', 'POST', typingData);
+    } catch (err) {
+      ctx.log?.warn?.(`[zulip] Typing ${op} failed: ${err.message}`);
+    }
+  };
+
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: inboundCtx,
     cfg,
     dispatcherOptions: {
+      onReplyStart: () => sendTypingOp('start'),
+      onIdle: () => sendTypingOp('stop'),
+      onCleanup: () => sendTypingOp('stop'),
       deliver: async (payload) => {
         let replyText = typeof payload === 'string' ? payload : (payload.body ?? payload.text ?? '');
         if (!replyText) return;

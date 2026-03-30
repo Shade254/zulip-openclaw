@@ -416,10 +416,47 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
   const replyType = isStream ? 'stream' : 'private';
   const replyTopic = isStream ? msg.subject : undefined;
 
+  // Zulip typing indicator with heartbeat (server expires after ~15s without refresh)
+  const TYPING_HEARTBEAT_MS = 10_000;
+  let typingInterval = null;
+  let typingStopped = false;
+
+  const sendTypingOp = async (op) => {
+    try {
+      const typingData = isStream
+        ? { op, type: 'stream', stream_id: msg.stream_id, topic: msg.subject }
+        : { op, type: 'direct', to: JSON.stringify([msg.sender_id]) };
+      await zulipApi(creds, '/typing', 'POST', typingData);
+    } catch (err) {
+      if (err instanceof RateLimitError) {
+        ctx.log?.warn?.(`[zulip] Typing ${op} rate-limited (retry-after ${err.retryAfterMs / 1000}s)`);
+      } else {
+        ctx.log?.warn?.(`[zulip] Typing ${op} failed: ${err.message}`);
+      }
+    }
+  };
+
+  const startTyping = () => {
+    if (typingInterval) return;
+    typingStopped = false;
+    sendTypingOp('start');
+    typingInterval = setInterval(() => sendTypingOp('start'), TYPING_HEARTBEAT_MS);
+  };
+
+  const stopTyping = () => {
+    if (typingStopped) return;
+    typingStopped = true;
+    if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
+    sendTypingOp('stop');
+  };
+
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: inboundCtx,
     cfg,
     dispatcherOptions: {
+      onReplyStart: () => startTyping(),
+      onIdle: () => stopTyping(),
+      onCleanup: () => stopTyping(),
       deliver: async (payload) => {
         let replyText = typeof payload === 'string' ? payload : (payload.body ?? payload.text ?? '');
         if (!replyText) return;

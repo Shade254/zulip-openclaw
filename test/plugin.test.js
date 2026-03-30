@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const {
-  zulipPlugin, zulipApi, zulipUpload,
+  zulipPlugin, zulipApi, zulipUpload, RateLimitError,
   resolvePersonaForMessage, fetchThreadContext, handleInboundMessage, setPluginRuntime,
 } = require('../plugin');
 
@@ -891,7 +891,7 @@ describe('handleInboundMessage', () => {
   test('stream message builds correct inbound context shape', async () => {
     mockFetchThreadContext();
     const msg = {
-      id: 100, type: 'stream', display_recipient: 'general', subject: 'greetings',
+      id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
       content: '<p>Hello bot</p>', timestamp: 1700000000,
     };
@@ -940,7 +940,7 @@ describe('handleInboundMessage', () => {
     mockFetchThreadContext();
 
     const msg = {
-      id: 300, type: 'stream', display_recipient: 'dev', subject: 'ci',
+      id: 300, type: 'stream', stream_id: 30, display_recipient: 'dev', subject: 'ci',
       sender_full_name: 'Bob', sender_id: 88, sender_email: 'bob@example.com',
       content: '<p>test</p>', timestamp: 1700000000,
     };
@@ -981,7 +981,7 @@ describe('handleInboundMessage', () => {
     mockFetchThreadContext();
 
     const msg = {
-      id: 500, type: 'stream', display_recipient: 'general', subject: 'test',
+      id: 500, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
       content: '<p>hi</p>', timestamp: 1700000000,
     };
@@ -1032,7 +1032,7 @@ describe('handleInboundMessage', () => {
     mockFetchThreadContext();
 
     const msg = {
-      id: 700, type: 'stream', display_recipient: 'general', subject: 'test',
+      id: 700, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
       content: '<p>hi</p>', timestamp: 1700000000,
     };
@@ -1047,7 +1047,7 @@ describe('handleInboundMessage', () => {
   test('does not crash when msg.content is undefined', async () => {
     mockFetchThreadContext();
     const msg = {
-      id: 750, type: 'stream', display_recipient: 'general', subject: 'test',
+      id: 750, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
       content: undefined, timestamp: 1700000000,
     };
@@ -1062,7 +1062,7 @@ describe('handleInboundMessage', () => {
     mockFetchThreadContext();
 
     const msg = {
-      id: 800, type: 'stream', display_recipient: 'general', subject: 'test',
+      id: 800, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
       content: '<p>hi</p>', timestamp: 1700000000,
     };
@@ -1079,5 +1079,149 @@ describe('handleInboundMessage', () => {
     const lastCall = global.fetch.mock.calls[global.fetch.mock.calls.length - 1];
     const body = new URLSearchParams(lastCall[1].body);
     expect(body.get('content')).toBe('object payload');
+  });
+
+  // --- Typing indicators ---
+
+  describe('typing indicators', () => {
+    const streamMsg = {
+      id: 900, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: '<p>hi</p>', timestamp: 1700000000,
+    };
+
+    const privateMsg = {
+      id: 901, type: 'private', display_recipient: [],
+      subject: '', sender_full_name: 'Bob', sender_id: 88,
+      sender_email: 'bob@example.com', content: '<p>hi</p>', timestamp: 1700000000,
+    };
+
+    function typingCalls() {
+      return global.fetch.mock.calls
+        .filter(([url]) => url.includes('/typing'))
+        .map(([, opts]) => Object.fromEntries(new URLSearchParams(opts.body)));
+    }
+
+    function mockTypingOk() {
+      global.fetch.mockResolvedValue({
+        ok: true, status: 200,
+        json: () => Promise.resolve({ result: 'success' }),
+      });
+    }
+
+    test('onReplyStart sends stream typing start with correct payload', async () => {
+      mockTypingOk();
+      await handleInboundMessage({}, creds, account, streamMsg, myUserId);
+
+      const opts = capturedDispatchArgs.dispatcherOptions;
+      opts.onReplyStart();
+      await new Promise(r => setImmediate(r));
+      opts.onCleanup();
+
+      const calls = typingCalls();
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(calls[0]).toEqual({ op: 'start', type: 'stream', stream_id: '10', topic: 'test' });
+    });
+
+    test('onReplyStart sends direct typing start with correct payload', async () => {
+      mockTypingOk();
+      await handleInboundMessage({}, creds, account, privateMsg, myUserId);
+
+      const opts = capturedDispatchArgs.dispatcherOptions;
+      opts.onReplyStart();
+      await new Promise(r => setImmediate(r));
+      opts.onCleanup();
+
+      const calls = typingCalls();
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(calls[0]).toEqual({ op: 'start', type: 'direct', to: '[88]' });
+    });
+
+    test('onCleanup sends typing stop', async () => {
+      mockTypingOk();
+      await handleInboundMessage({}, creds, account, streamMsg, myUserId);
+
+      const opts = capturedDispatchArgs.dispatcherOptions;
+      await opts.onReplyStart();
+      await opts.onCleanup();
+
+      const calls = typingCalls();
+      const stopCalls = calls.filter(c => c.op === 'stop');
+      expect(stopCalls.length).toBe(1);
+      expect(stopCalls[0]).toEqual({ op: 'stop', type: 'stream', stream_id: '10', topic: 'test' });
+    });
+
+    test('double stop is deduplicated (onIdle + onCleanup sends stop only once)', async () => {
+      mockTypingOk();
+      await handleInboundMessage({}, creds, account, streamMsg, myUserId);
+
+      const opts = capturedDispatchArgs.dispatcherOptions;
+      await opts.onReplyStart();
+      await opts.onIdle();
+      await opts.onCleanup();
+
+      const stopCalls = typingCalls().filter(c => c.op === 'stop');
+      expect(stopCalls.length).toBe(1);
+    });
+
+    test('typing failure does not propagate (error is swallowed)', async () => {
+      // Thread context call succeeds, then typing calls fail
+      global.fetch
+        .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ result: 'success', messages: [] }) })
+        .mockRejectedValue(new Error('network down'));
+
+      const log = { warn: jest.fn(), error: jest.fn() };
+      await handleInboundMessage({ log }, creds, account, streamMsg, myUserId);
+
+      const opts = capturedDispatchArgs.dispatcherOptions;
+      opts.onReplyStart();
+      await new Promise(r => setImmediate(r));
+      opts.onCleanup();
+
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Typing start failed'));
+    });
+
+    test('RateLimitError on typing logs retry-after duration', async () => {
+      global.fetch
+        .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ result: 'success', messages: [] }) })
+        .mockRejectedValue(new RateLimitError(30));
+
+      const log = { warn: jest.fn(), error: jest.fn() };
+      await handleInboundMessage({ log }, creds, account, streamMsg, myUserId);
+
+      const opts = capturedDispatchArgs.dispatcherOptions;
+      opts.onReplyStart();
+      await new Promise(r => setImmediate(r));
+      opts.onCleanup();
+
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('rate-limited'));
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('30s'));
+    });
+
+    test('heartbeat re-sends start on interval and stops after cleanup', async () => {
+      jest.useFakeTimers();
+      mockTypingOk();
+      await handleInboundMessage({}, creds, account, streamMsg, myUserId);
+
+      await capturedDispatchArgs.dispatcherOptions.onReplyStart();
+      expect(typingCalls().filter(c => c.op === 'start').length).toBe(1);
+
+      // Simulate 30s of generation — 3 heartbeat ticks
+      for (let i = 2; i <= 4; i++) {
+        jest.advanceTimersByTime(10_000);
+        await Promise.resolve();
+        expect(typingCalls().filter(c => c.op === 'start').length).toBe(i);
+      }
+
+      // Stop should clear the interval
+      await capturedDispatchArgs.dispatcherOptions.onCleanup();
+
+      jest.advanceTimersByTime(10_000);
+      await Promise.resolve();
+
+      expect(typingCalls().filter(c => c.op === 'start').length).toBe(4); // no more heartbeats
+
+      jest.useRealTimers();
+    });
   });
 });

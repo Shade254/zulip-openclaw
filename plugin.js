@@ -5,8 +5,8 @@
  * reactions, and persona support.
  */
 
-const { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, statSync, unlinkSync } = require('fs');
-const { readFile, stat } = require('fs/promises');
+const { readFileSync, existsSync } = require('fs');
+const { readFile, stat, mkdir, writeFile, readdir, unlink } = require('fs/promises');
 const { join, extname, basename } = require('path');
 const { homedir } = require('os');
 
@@ -341,8 +341,8 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
   let text = (msg.content ?? '').replace(/<[^>]*>/g, '');
 
   try {
-    cleanupAttachments();
-    const { attachments } = await resolveAttachments(creds, msg.content ?? '');
+    await cleanupAttachments();
+    const { attachments } = await resolveAttachments(creds, msg.content ?? '', ctx.log);
     if (attachments.length > 0) {
       const attachmentLines = attachments.map(a => {
         if (a.type === 'skipped') return `[Attachment: ${a.filename} — ${a.reason}]`;
@@ -498,68 +498,71 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
 
 const ZULIP_ATTACHMENTS_DIR = join(homedir(), '.openclaw', 'workspace', '.zulip-attachments');
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
-const MAX_FILE_SIZE_MB = 25;
 
-async function resolveAttachments(creds, htmlContent) {
+async function resolveAttachments(creds, htmlContent, log) {
   const uploadRegex = /\/user_uploads\/([^\s"'<>)]+)/g;
   const matches = [...new Set([...htmlContent.matchAll(uploadRegex)].map(m => m[0]))];
 
   if (matches.length === 0) return { attachments: [] };
 
-  mkdirSync(ZULIP_ATTACHMENTS_DIR, { recursive: true });
-  const attachments = [];
+  await mkdir(ZULIP_ATTACHMENTS_DIR, { recursive: true });
 
-  for (const uploadPath of matches) {
-    try {
-      const apiResult = await zulipApi(creds, uploadPath);
+  const results = await Promise.allSettled(matches.map(async (uploadPath, idx) => {
+    const rawFilename = uploadPath.split('/').pop() || 'attachment';
+    const filename = sanitizeFilename(rawFilename);
 
-      if (apiResult.result !== 'success' || !apiResult.url) {
-        console.warn(`[zulip] Failed to get temp URL for ${uploadPath}: ${apiResult.msg}`);
-        continue;
-      }
+    const apiResult = await zulipApi(creds, uploadPath);
 
-      const tempUrl = `${creds.site}${apiResult.url}`;
-      const filename = uploadPath.split('/').pop() || 'attachment';
-      const ext = extname(filename).toLowerCase();
-      const timestamp = Date.now();
-      const localFilename = `${timestamp}-${filename}`;
-      const localPath = join(ZULIP_ATTACHMENTS_DIR, localFilename);
-
-      const response = await fetch(tempUrl);
-      if (!response.ok) continue;
-
-      const contentLength = response.headers.get('content-length');
-      if (contentLength && parseInt(contentLength, 10) > MAX_FILE_SIZE_MB * 1024 * 1024) {
-        attachments.push({ filename, localPath: null, type: 'skipped', reason: `File too large (>${MAX_FILE_SIZE_MB}MB)` });
-        continue;
-      }
-
-      const buffer = Buffer.from(await response.arrayBuffer());
-      if (buffer.length > MAX_FILE_SIZE_MB * 1024 * 1024) {
-        attachments.push({ filename, localPath: null, type: 'skipped', reason: `File too large (>${MAX_FILE_SIZE_MB}MB)` });
-        continue;
-      }
-
-      writeFileSync(localPath, buffer);
-      const type = IMAGE_EXTENSIONS.has(ext) ? 'image' : 'file';
-      attachments.push({ filename, localPath, type, ext });
-    } catch (err) {
-      console.warn(`[zulip] Attachment resolve error: ${err.message}`);
+    if (apiResult.result !== 'success' || !apiResult.url) {
+      log?.warn?.(`[zulip] Failed to get temp URL for ${uploadPath}: ${apiResult.msg}`);
+      return { filename, localPath: null, type: 'skipped', reason: 'Failed to resolve download URL' };
     }
-  }
+
+    const tempUrl = `${creds.site}${apiResult.url}`;
+    const ext = extname(filename).toLowerCase();
+    const localFilename = `${Date.now()}-${idx}-${filename}`;
+    const localPath = join(ZULIP_ATTACHMENTS_DIR, localFilename);
+
+    const response = await fetch(tempUrl);
+    if (!response.ok) {
+      return { filename, localPath: null, type: 'skipped', reason: `Download failed (HTTP ${response.status})` };
+    }
+
+    const contentLength = response.headers.get('content-length');
+    if (contentLength && parseInt(contentLength, 10) > MAX_UPLOAD_SIZE_BYTES) {
+      return { filename, localPath: null, type: 'skipped', reason: `File too large (>${MAX_UPLOAD_SIZE_MB}MB)` };
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > MAX_UPLOAD_SIZE_BYTES) {
+      return { filename, localPath: null, type: 'skipped', reason: `File too large (>${MAX_UPLOAD_SIZE_MB}MB)` };
+    }
+
+    await writeFile(localPath, buffer);
+    const type = IMAGE_EXTENSIONS.has(ext) ? 'image' : 'file';
+    return { filename, localPath, type, ext };
+  }));
+
+  const attachments = results.map((r) => {
+    if (r.status === 'rejected') {
+      log?.warn?.(`[zulip] Attachment resolve error: ${r.reason?.message}`);
+      return { filename: 'unknown', localPath: null, type: 'skipped', reason: r.reason?.message ?? 'Unknown error' };
+    }
+    return r.value;
+  });
 
   return { attachments };
 }
 
-function cleanupAttachments(maxAgeMs = 5 * 60 * 1000) {
+async function cleanupAttachments(maxAgeMs = 5 * 60 * 1000) {
   if (!existsSync(ZULIP_ATTACHMENTS_DIR)) return;
   const now = Date.now();
-  for (const file of readdirSync(ZULIP_ATTACHMENTS_DIR)) {
+  for (const file of await readdir(ZULIP_ATTACHMENTS_DIR)) {
     const filePath = join(ZULIP_ATTACHMENTS_DIR, file);
     try {
-      const stat = statSync(filePath);
-      if (now - stat.mtimeMs > maxAgeMs) {
-        unlinkSync(filePath);
+      const fileStat = await stat(filePath);
+      if (now - fileStat.mtimeMs > maxAgeMs) {
+        await unlink(filePath);
       }
     } catch {
       // ignore cleanup races
@@ -940,4 +943,5 @@ module.exports = {
   zulipPlugin, zulipApi, zulipUpload, loadCredentials, setPluginRuntime, RateLimitError,
   // Exported for direct unit testing
   resolvePersonaForMessage, fetchThreadContext, handleInboundMessage,
+  resolveAttachments, cleanupAttachments, ZULIP_ATTACHMENTS_DIR,
 };

@@ -5,15 +5,9 @@
  * reactions, and persona support.
  */
 
-const { readFileSync, existsSync } = require('fs');
-const { readFile, stat, mkdir, writeFile, readdir, unlink } = require('fs/promises');
-const { join, extname, basename } = require('path');
+const { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, readdirSync } = require('fs');
+const { join, extname } = require('path');
 const { homedir } = require('os');
-
-const { version } = require('./package.json');
-const USER_AGENT = `zulip-openclaw/${version}`;
-const MAX_UPLOAD_SIZE_MB = 25;
-const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
 
 // --- Plugin Runtime (set during registration) ---
 
@@ -30,8 +24,9 @@ function getPluginRuntime() {
 
 // --- Credentials ---
 
-function loadCredentials() {
-  const secretsPath = join(homedir(), '.openclaw', 'secrets', 'zulip.env');
+function loadCredentials(accountId = 'default') {
+  const filename = accountId === 'default' ? 'zulip.env' : `zulip-${accountId}.env`;
+  const secretsPath = join(homedir(), '.openclaw', 'secrets', filename);
   if (!existsSync(secretsPath)) return null;
 
   const content = readFileSync(secretsPath, 'utf-8');
@@ -44,6 +39,34 @@ function loadCredentials() {
     if (key === 'ZULIP_SITE') creds.site = value;
   }
   return (creds.email && creds.apiKey && creds.site) ? creds : null;
+}
+
+function listAccountIdsFromSecrets() {
+  const secretsDir = join(homedir(), '.openclaw', 'secrets');
+  if (!existsSync(secretsDir)) return [];
+
+  const ids = [];
+  for (const file of readdirSync(secretsDir)) {
+    if (file === 'zulip.env') {
+      ids.push('default');
+    } else {
+      const m = file.match(/^zulip-(.+)\.env$/);
+      if (m) ids.push(m[1]);
+    }
+  }
+  return ids;
+}
+
+function siteNameFromCreds(creds) {
+  if (!creds?.site) return 'Zulip';
+  try {
+    const hostname = new URL(creds.site).hostname; // e.g. site-tech.zulipchat.com
+    const org = hostname.split('.')[0]; // e.g. site-tech
+    // Title-case with hyphens → spaces
+    return org.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('-') + ' Zulip';
+  } catch {
+    return 'Zulip';
+  }
 }
 
 // --- Persona Routing (Optional) ---
@@ -594,16 +617,15 @@ const zulipPlugin = {
 
   config: {
     listAccountIds: (_cfg) => {
-      const creds = loadCredentials();
-      return creds ? ['default'] : [];
+      return listAccountIdsFromSecrets();
     },
 
     resolveAccount: (_cfg, accountId) => {
-      const creds = loadCredentials();
+      const creds = loadCredentials(accountId);
       if (!creds) return null;
       return {
         accountId: accountId ?? 'default',
-        name: 'Zulip Bot',
+        name: siteNameFromCreds(creds),
         email: creds.email,
         apiKey: creds.apiKey,
         site: creds.site,

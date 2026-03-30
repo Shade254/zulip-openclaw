@@ -437,6 +437,7 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
   };
 
   const startTyping = () => {
+    if (typingInterval) return;
     typingStopped = false;
     sendTypingOp('start');
     typingInterval = setInterval(() => sendTypingOp('start'), TYPING_HEARTBEAT_MS);

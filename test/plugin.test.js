@@ -1198,23 +1198,20 @@ describe('handleInboundMessage', () => {
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('30s'));
     });
 
-    test('heartbeat re-sends start on interval', async () => {
+    test('heartbeat re-sends start on interval and stops after cleanup', async () => {
       jest.useFakeTimers();
       mockTypingOk();
       await handleInboundMessage({}, creds, account, streamMsg, myUserId);
 
       await capturedDispatchArgs.dispatcherOptions.onReplyStart();
+      expect(typingCalls().filter(c => c.op === 'start').length).toBe(1);
 
-      const startsBefore = typingCalls().filter(c => c.op === 'start').length;
-      expect(startsBefore).toBe(1);
-
-      // Advance 10s — heartbeat should fire
-      jest.advanceTimersByTime(10_000);
-      // Allow the async sendTypingOp to resolve
-      await Promise.resolve();
-
-      const startsAfter = typingCalls().filter(c => c.op === 'start').length;
-      expect(startsAfter).toBe(2);
+      // Simulate 30s of generation — 3 heartbeat ticks
+      for (let i = 2; i <= 4; i++) {
+        jest.advanceTimersByTime(10_000);
+        await Promise.resolve();
+        expect(typingCalls().filter(c => c.op === 'start').length).toBe(i);
+      }
 
       // Stop should clear the interval
       await capturedDispatchArgs.dispatcherOptions.onCleanup();
@@ -1222,8 +1219,7 @@ describe('handleInboundMessage', () => {
       jest.advanceTimersByTime(10_000);
       await Promise.resolve();
 
-      const startsFinal = typingCalls().filter(c => c.op === 'start').length;
-      expect(startsFinal).toBe(2); // no more heartbeats
+      expect(typingCalls().filter(c => c.op === 'start').length).toBe(4); // no more heartbeats
 
       jest.useRealTimers();
     });

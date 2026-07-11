@@ -15,6 +15,39 @@ const USER_AGENT = `zulip-openclaw/${version}`;
 const MAX_UPLOAD_SIZE_MB = 25;
 const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
 
+// --- Delivery deduplication guard ---
+// Prevents the same content from being sent twice to the same target+topic
+// within a short time window. This handles the intermittent block+final
+// double-delivery race in the OpenClaw dispatch runtime.
+const DELIVER_DEDUP_TTL_MS = 10_000; // 10 second window
+const deliverDedupMap = new Map(); // key: "target|topic|contentHash" → timestamp
+
+function contentHash(text) {
+  // Fast, non-crypto hash for dedup purposes. Include length to reduce collision risk.
+  let h = 5381;
+  for (let i = 0; i < text.length; i++) {
+    h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+  }
+  return `${h}:${text.length}`;
+}
+
+function isDuplicateDelivery(target, topic, content) {
+  const key = `${target}|${topic ?? ''}|${contentHash(content)}`;
+  const now = Date.now();
+  // Purge expired entries (amortized cleanup)
+  if (deliverDedupMap.size > 200) {
+    for (const [k, ts] of deliverDedupMap) {
+      if (now - ts > DELIVER_DEDUP_TTL_MS) deliverDedupMap.delete(k);
+    }
+  }
+  const existing = deliverDedupMap.get(key);
+  if (existing && (now - existing) < DELIVER_DEDUP_TTL_MS) {
+    return true; // duplicate
+  }
+  deliverDedupMap.set(key, now);
+  return false;
+}
+
 // --- Plugin Runtime (set during registration) ---
 
 let pluginRuntime = null;
@@ -477,6 +510,12 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
 
         if (personaDisplayName) {
           replyText = `[${personaDisplayName}] ${replyText}`;
+        }
+
+        // Guard against duplicate delivery (block+final race in dispatch runtime)
+        if (isDuplicateDelivery(replyTarget, replyTopic, replyText)) {
+          ctx.log?.warn?.(`[zulip] Skipping duplicate delivery to ${replyTarget}/${replyTopic ?? 'dm'} (${replyText.length} chars)`);
+          return;
         }
 
         const data = { type: replyType, to: replyTarget, content: replyText };

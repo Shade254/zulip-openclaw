@@ -30,7 +30,26 @@ function getPluginRuntime() {
 
 // --- Credentials ---
 
+// Cached because credential presence gates message-tool discovery
+// (actions.describeMessageTool), which the gateway invokes for every
+// registered channel while building agent tool schemas — a hot path that
+// must not do synchronous filesystem reads per call.
+const CREDENTIALS_CACHE_TTL_MS = 30_000;
+let credentialsCache = { value: null, readAt: -Infinity };
+
+function resetCredentialsCache() {
+  credentialsCache = { value: null, readAt: -Infinity };
+}
+
 function loadCredentials() {
+  if (Date.now() - credentialsCache.readAt < CREDENTIALS_CACHE_TTL_MS) {
+    return credentialsCache.value;
+  }
+  credentialsCache = { value: readCredentialsFromDisk(), readAt: Date.now() };
+  return credentialsCache.value;
+}
+
+function readCredentialsFromDisk() {
   const secretsPath = join(homedir(), '.openclaw', 'secrets', 'zulip.env');
   if (!existsSync(secretsPath)) return null;
 
@@ -134,7 +153,9 @@ function guessMimeType(filename) {
 }
 
 function resolveMessageTarget(to, replyToId) {
-  let type = 'private';
+  // 'direct' replaced the deprecated 'private' in Zulip 7.0 (feature level
+  // 174); 'private' still works but is scheduled for eventual removal.
+  let type = 'direct';
   let target = to;
   let topic = replyToId ?? 'chat';
 
@@ -287,7 +308,8 @@ async function zulipUpload(creds, source) {
   const result = await response.json();
   if (result.result !== 'success') throw new Error(`Zulip upload failed: ${result.msg}`);
 
-  return { ok: true, uri: result.uri ?? result.url, filename };
+  // `url` is the current field name (Zulip 9.0+); `uri` is the deprecated alias.
+  return { ok: true, uri: result.url ?? result.uri, filename };
 }
 
 // --- Gateway Helpers ---
@@ -301,7 +323,17 @@ async function fetchThreadContext(creds, msg, myUserId) {
     contextNarrow.push({ operator: 'stream', operand: msg.display_recipient });
     contextNarrow.push({ operator: 'topic', operand: msg.subject });
   } else {
-    contextNarrow.push({ operator: 'dm', operand: [creds.email, msg.sender_email] });
+    // dm narrow operands must be user IDs (or one comma-separated email
+    // string) — an array of email strings is rejected by the server. The
+    // conversation is identified by the other participants; the server
+    // implicitly includes the bot itself.
+    const participantIds = (Array.isArray(msg.display_recipient) ? msg.display_recipient : [])
+      .map(u => u.id)
+      .filter(id => typeof id === 'number' && id !== myUserId);
+    contextNarrow.push({
+      operator: 'dm',
+      operand: participantIds.length > 0 ? participantIds : [msg.sender_id],
+    });
   }
 
   const contextQs = new URLSearchParams({
@@ -309,6 +341,7 @@ async function fetchThreadContext(creds, msg, myUserId) {
     num_before: String(CONTEXT_LIMIT),
     num_after: '0',
     anchor: String(msg.id),
+    apply_markdown: 'false', // raw Markdown, not rendered HTML
   }).toString();
 
   const contextResult = await zulipApi(creds, `/messages?${contextQs}`);
@@ -318,7 +351,7 @@ async function fetchThreadContext(creds, msg, myUserId) {
 
   const formatted = contextResult.messages.map(m => {
     const name = m.sender_id === myUserId ? '(bot)' : m.sender_full_name;
-    const content = m.content.replace(/<[^>]*>/g, '');
+    const content = m.content; // raw Markdown (apply_markdown=false)
     const reactions = (m.reactions ?? []).map(r => r.emoji_name);
     const reactStr = reactions.length > 0 ? ` [reacts: ${reactions.join(', ')}]` : '';
     return `[${name}] (id:${m.id}) ${content}${reactStr}`;
@@ -338,7 +371,9 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
   const from = isStream
     ? `zulip:${msg.display_recipient}`
     : `zulip:${msg.sender_id}`;
-  let text = (msg.content ?? '').replace(/<[^>]*>/g, '');
+  // Event content is raw Markdown: /register is called without
+  // apply_markdown, which defaults to false. No HTML to strip.
+  let text = msg.content ?? '';
 
   try {
     await cleanupAttachments();
@@ -599,6 +634,11 @@ async function cleanupAttachments(maxAgeMs = 5 * 60 * 1000) {
 
 // --- Channel Plugin Definition ---
 
+// Actions exposed through OpenClaw's shared `message` tool. Frozen because the
+// same array is handed to the gateway on every discovery call (the gateway
+// copies before use).
+const MESSAGE_ACTIONS = Object.freeze(['send', 'react', 'reactions', 'read', 'edit', 'delete']);
+
 const zulipPlugin = {
   id: 'zulip-openclaw',
 
@@ -724,11 +764,19 @@ const zulipPlugin = {
   },
 
   actions: {
-    listActions: ({ cfg }) => {
+    // Message-tool discovery hook, required since OpenClaw 2026.3.22 (which
+    // removed the legacy listActions adapter). The gateway calls this to learn
+    // which actions the shared `message` tool should expose for Zulip;
+    // execution still goes through handleAction.
+    describeMessageTool: ({ cfg }) => {
       const accounts = zulipPlugin.config.listAccountIds(cfg);
-      if (accounts.length === 0) return [];
-      return ['send', 'react', 'reactions', 'read', 'edit', 'delete'];
+      if (accounts.length === 0) return null;
+      return { actions: MESSAGE_ACTIONS };
     },
+
+    // Editing or deleting existing messages is privileged: the gateway only
+    // dispatches these when the requester's sender identity is trusted.
+    requiresTrustedRequesterSender: ({ action }) => action === 'edit' || action === 'delete',
 
     handleAction: async ({ action, params, cfg, accountId }) => {
       const account = zulipPlugin.config.resolveAccount(cfg, accountId);
@@ -789,19 +837,20 @@ const zulipPlugin = {
           num_before: String(limit),
           num_after: '0',
           anchor: 'newest',
+          apply_markdown: 'false', // raw Markdown, not rendered HTML
         };
         const qs = new URLSearchParams(queryParams).toString();
         const result = await zulipApi(creds, `/messages?${qs}`);
-        
+
         if (result.result === 'success') {
           const messages = (result.messages ?? []).reverse().map(m => ({
             id: String(m.id),
             sender: m.sender_full_name,
             senderEmail: m.sender_email,
-            content: m.content.replace(/<[^>]*>/g, ''), // strip HTML
+            content: m.content,
             topic: m.subject,
             timestamp: m.timestamp,
-            reactions: (m.reactions ?? []).map(r => ({ emoji: r.emoji_name, user: r.user.full_name })),
+            reactions: (m.reactions ?? []).map(r => ({ emoji: r.emoji_name, user: r.user?.full_name ?? 'unknown' })),
           }));
           return { ok: true, messages };
         }
@@ -888,7 +937,9 @@ const zulipPlugin = {
 
             if (result.result !== 'success') {
               consecutiveErrors++;
-              if (String(result.msg).includes('BAD_EVENT_QUEUE_ID')) {
+              // Match on `code`, not `msg`: the human-readable msg is
+              // "Bad event queue ID: <uuid>" and never contains the constant.
+              if (result.code === 'BAD_EVENT_QUEUE_ID') {
                 ctx.log?.warn?.('[zulip] Queue expired, re-registering...');
                 if (!await reRegister()) {
                   await backoff(consecutiveErrors);
@@ -971,4 +1022,5 @@ module.exports = {
   // Exported for direct unit testing
   resolvePersonaForMessage, fetchThreadContext, handleInboundMessage,
   resolveAttachments, cleanupAttachments, ZULIP_ATTACHMENTS_DIR,
+  MESSAGE_ACTIONS, resetCredentialsCache,
 };

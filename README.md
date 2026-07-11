@@ -51,6 +51,15 @@ The plugin loads in OpenClaw and implements the core channel plugin contract (co
 
 The plugin registers as an OpenClaw channel. All messaging goes through OpenClaw's native `message` tool via `actions.handleAction`. Agent tools (`zulip_send`, `zulip_read`, `zulip_react`) are also registered for direct use.
 
+## OpenClaw compatibility
+
+Requires OpenClaw **2026.3.22 or later**. Two gateway plugin-API changes (both predating 2026.6.11, per the gateway changelog) shape how this plugin registers:
+
+- **Message-action discovery** (since 2026.3.22, breaking) — the gateway discovers channel actions by calling `actions.describeMessageTool(context)`; the legacy `actions.listActions` adapter was removed. If the hook is missing, the gateway catches and logs a `[message-action-discovery] … failed` error while building tool schemas, and Zulip's message actions silently disappear from the shared `message` tool — the gateway keeps running.
+- **Tool ownership contract** (enforced since 2026.5.2) — agent tools only register when the plugin manifest declares them upfront. `openclaw.plugin.json` lists all three tools under `contracts.tools`; if you add or rename a tool in `index.js`, update that list too (the `contracts.test.js` suite fails on any drift). Undeclared tools are rejected with the diagnostic `plugin must declare contracts.tools for: <name>`.
+
+The manifest also declares `channelConfigs.zulip` so the gateway's config-schema, setup, and Control UI surfaces know the channel exists before the plugin runtime loads (without it, the gateway logs a boot warning and the setup UI is limited). The declared schema is intentionally open (`additionalProperties: true`, no per-field constraints) so core channel options like `blockStreaming` keep validating exactly as core defines them — Zulip credentials live in `~/.openclaw/secrets/zulip.env`, never in `channels.zulip`.
+
 ## Setup
 
 **Requires Node.js 18+** (for native fetch)

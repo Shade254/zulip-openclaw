@@ -91,31 +91,6 @@ describe('Unit Tests', () => {
     });
   });
 
-  describe('HTML stripping (used in message parsing)', () => {
-    // The plugin uses this regex: content.replace(/<[^>]*>/g, '')
-    const stripHtml = (content) => content.replace(/<[^>]*>/g, '');
-
-    test('removes simple tags', () => {
-      expect(stripHtml('<p>Hello</p>')).toBe('Hello');
-    });
-
-    test('removes nested tags', () => {
-      expect(stripHtml('<div><span>Hello</span></div>')).toBe('Hello');
-    });
-
-    test('removes tags with attributes', () => {
-      expect(stripHtml('<a href="http://example.com">link</a>')).toBe('link');
-    });
-
-    test('handles Zulip-style formatted messages', () => {
-      expect(stripHtml('<p>Hello <strong>world</strong>!</p>')).toBe('Hello world!');
-    });
-
-    test('leaves plain text unchanged', () => {
-      expect(stripHtml('Hello world')).toBe('Hello world');
-    });
-  });
-
   // These helpers are not exported, so we test them indirectly through
   // the exported functions that use them. However, we can test the
   // resolveMessageTarget/createMessagePayload behavior through sendText.
@@ -154,21 +129,21 @@ describe('Unit Tests', () => {
       expect(body.get('topic')).toBe('standup');
     });
 
-    test('routes private: prefix correctly', async () => {
+    test('routes private: prefix to a direct message', async () => {
       await zulipPlugin.outbound.sendText({
         to: 'private:alice@example.com', text: 'hi', accountId: 'default', cfg: {}
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
-      expect(body.get('type')).toBe('private');
+      expect(body.get('type')).toBe('direct');
       expect(body.get('to')).toBe('alice@example.com');
     });
 
-    test('defaults to private type for bare target', async () => {
+    test('defaults to direct type for bare target', async () => {
       await zulipPlugin.outbound.sendText({
         to: 'alice@example.com', text: 'hi', accountId: 'default', cfg: {}
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
-      expect(body.get('type')).toBe('private');
+      expect(body.get('type')).toBe('direct');
       expect(body.get('to')).toBe('alice@example.com');
     });
 
@@ -330,14 +305,14 @@ describe('Mock Tests', () => {
       expect(opts.method).toBe('POST');
     });
 
-    test('read action fetches messages', async () => {
+    test('read action fetches messages as raw Markdown', async () => {
       global.fetch.mockResolvedValue({
         ok: true, status: 200,
         json: () => Promise.resolve({
           result: 'success',
           messages: [
             { id: 1, sender_full_name: 'Alice', sender_email: 'alice@example.com',
-              content: '<p>Hello</p>', subject: 'test', timestamp: 1234567890, reactions: [] }
+              content: 'Hello **world**', subject: 'test', timestamp: 1234567890, reactions: [] }
           ]
         })
       });
@@ -352,7 +327,10 @@ describe('Mock Tests', () => {
       expect(result.ok).toBe(true);
       expect(result.messages).toHaveLength(1);
       expect(result.messages[0].sender).toBe('Alice');
-      expect(result.messages[0].content).toBe('Hello'); // HTML stripped
+      expect(result.messages[0].content).toBe('Hello **world**');
+      // Raw Markdown is requested explicitly rather than stripping HTML.
+      const [url] = global.fetch.mock.calls[0];
+      expect(url).toContain('apply_markdown=false');
     });
 
     test('returns error for unknown action', async () => {
@@ -386,7 +364,7 @@ describe('Mock Tests', () => {
       expect(body.get('topic')).toBe('greetings');
     });
 
-    test('send action uses createMessagePayload for private routing', async () => {
+    test('send action uses createMessagePayload for direct routing', async () => {
       global.fetch.mockResolvedValue({
         ok: true, status: 200,
         json: () => Promise.resolve({ result: 'success', id: 101 })
@@ -401,7 +379,7 @@ describe('Mock Tests', () => {
 
       const [, opts] = global.fetch.mock.calls[0];
       const body = new URLSearchParams(opts.body);
-      expect(body.get('type')).toBe('private');
+      expect(body.get('type')).toBe('direct');
       expect(body.get('to')).toBe('user@example.com');
     });
   });
@@ -734,8 +712,8 @@ describe('fetchThreadContext', () => {
       json: () => Promise.resolve({
         result: 'success',
         messages: [
-          { id: 10, sender_id: 99, sender_full_name: 'Alice', content: '<p>Hello</p>', reactions: [] },
-          { id: 11, sender_id: 42, sender_full_name: 'Bot', content: '<p>Hi there</p>', reactions: [] },
+          { id: 10, sender_id: 99, sender_full_name: 'Alice', content: 'Hello', reactions: [] },
+          { id: 11, sender_id: 42, sender_full_name: 'Bot', content: 'Hi there', reactions: [] },
         ],
       }),
     });
@@ -748,22 +726,48 @@ describe('fetchThreadContext', () => {
     expect(result).toContain('[(bot)] (id:11) Hi there');
   });
 
-  test('returns formatted context for private messages', async () => {
+  test('returns formatted context for direct messages', async () => {
     global.fetch.mockResolvedValue({
       ok: true, status: 200,
       json: () => Promise.resolve({
         result: 'success',
         messages: [
-          { id: 20, sender_id: 99, sender_full_name: 'Bob', content: '<p>Hey</p>', reactions: [] },
+          { id: 20, sender_id: 99, sender_full_name: 'Bob', content: 'Hey', reactions: [] },
         ],
       }),
     });
 
-    const msg = { id: 21, type: 'private', sender_email: 'bob@example.com' };
+    const msg = {
+      id: 21, type: 'private', sender_id: 99, sender_email: 'bob@example.com',
+      display_recipient: [
+        { id: 42, email: 'bot@example.com', full_name: 'Bot' },
+        { id: 99, email: 'bob@example.com', full_name: 'Bob' },
+      ],
+    };
     const result = await fetchThreadContext(creds, msg, 42);
 
     expect(result).toContain('Recent DM history:');
     expect(result).toContain('[Bob] (id:20) Hey');
+
+    // dm narrow operands must be user IDs excluding the bot itself — an
+    // array of email strings is rejected by the server with HTTP 400.
+    const [url] = global.fetch.mock.calls[0];
+    const narrow = JSON.parse(new URL(url).searchParams.get('narrow'));
+    expect(narrow).toContainEqual({ operator: 'dm', operand: [99] });
+  });
+
+  test('falls back to sender_id for the dm narrow without display_recipient', async () => {
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', messages: [] }),
+    });
+
+    const msg = { id: 22, type: 'private', sender_id: 99, sender_email: 'bob@example.com' };
+    await fetchThreadContext(creds, msg, 42);
+
+    const [url] = global.fetch.mock.calls[0];
+    const narrow = JSON.parse(new URL(url).searchParams.get('narrow'));
+    expect(narrow).toContainEqual({ operator: 'dm', operand: [99] });
   });
 
   test('includes reaction info in formatted output', async () => {
@@ -772,7 +776,7 @@ describe('fetchThreadContext', () => {
       json: () => Promise.resolve({
         result: 'success',
         messages: [
-          { id: 30, sender_id: 99, sender_full_name: 'Alice', content: '<p>Nice</p>',
+          { id: 30, sender_id: 99, sender_full_name: 'Alice', content: 'Nice',
             reactions: [{ emoji_name: 'thumbs_up' }, { emoji_name: 'heart' }] },
         ],
       }),
@@ -825,19 +829,28 @@ describe('fetchThreadContext', () => {
     ]);
   });
 
-  test('narrows by DM participants for private messages', async () => {
+  test('narrows by DM participant user IDs for private messages', async () => {
     global.fetch.mockResolvedValue({
       ok: true, status: 200,
       json: () => Promise.resolve({ result: 'success', messages: [] }),
     });
 
-    const msg = { id: 70, type: 'private', sender_email: 'alice@example.com' };
+    // Group DM: operand lists every participant except the bot itself, as
+    // integer user IDs (email-string arrays are rejected by the server).
+    const msg = {
+      id: 70, type: 'private', sender_id: 99, sender_email: 'alice@example.com',
+      display_recipient: [
+        { id: 42, email: 'bot@example.com', full_name: 'Bot' },
+        { id: 99, email: 'alice@example.com', full_name: 'Alice' },
+        { id: 7, email: 'carol@example.com', full_name: 'Carol' },
+      ],
+    };
     await fetchThreadContext(creds, msg, 42);
 
     const [url] = global.fetch.mock.calls[0];
     const narrow = JSON.parse(new URL(url).searchParams.get('narrow'));
     expect(narrow).toEqual([
-      { operator: 'dm', operand: ['bot@example.com', 'alice@example.com'] },
+      { operator: 'dm', operand: [99, 7] },
     ]);
   });
 });
@@ -1118,7 +1131,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>Hello bot</p>', timestamp: 1700000000,
+      content: 'Hello bot', timestamp: 1700000000,
     };
 
     await handleInboundMessage({}, creds, account, msg, myUserId);
@@ -1140,7 +1153,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 200, type: 'private', display_recipient: [{ email: 'alice@example.com' }],
       subject: '', sender_full_name: 'Alice', sender_id: 99,
-      sender_email: 'alice@example.com', content: '<p>DM hello</p>', timestamp: 1700000000,
+      sender_email: 'alice@example.com', content: 'DM hello', timestamp: 1700000000,
     };
 
     await handleInboundMessage({}, creds, account, msg, myUserId);
@@ -1167,7 +1180,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 300, type: 'stream', stream_id: 30, display_recipient: 'dev', subject: 'ci',
       sender_full_name: 'Bob', sender_id: 88, sender_email: 'bob@example.com',
-      content: '<p>test</p>', timestamp: 1700000000,
+      content: 'test', timestamp: 1700000000,
     };
 
     await handleInboundMessage({}, creds, account, msg, myUserId);
@@ -1192,7 +1205,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 400, type: 'private', display_recipient: [],
       subject: '', sender_full_name: 'Carol', sender_id: 77,
-      sender_email: 'carol@example.com', content: '<p>hi</p>', timestamp: 1700000000,
+      sender_email: 'carol@example.com', content: 'hi', timestamp: 1700000000,
     };
 
     await handleInboundMessage({}, creds, account, msg, myUserId);
@@ -1208,7 +1221,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 500, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>hi</p>', timestamp: 1700000000,
+      content: 'hi', timestamp: 1700000000,
     };
 
     await handleInboundMessage({}, creds, account, msg, myUserId);
@@ -1234,7 +1247,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>Hello bot</p>', timestamp: 1700000000,
+      content: 'Hello bot', timestamp: 1700000000,
     };
     global.fetch.mockResolvedValue({
       ok: true, status: 200,
@@ -1258,7 +1271,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>Hello bot</p>', timestamp: 1700000000,
+      content: 'Hello bot', timestamp: 1700000000,
     };
     global.fetch
       .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ result: 'success', messages: [] }) })
@@ -1279,7 +1292,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>Hello bot</p>', timestamp: 1700000000,
+      content: 'Hello bot', timestamp: 1700000000,
     };
     await handleInboundMessage({ log }, creds, account, msg, myUserId);
     let finishBlock;
@@ -1303,7 +1316,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>Hello bot</p>', timestamp: 1700000000,
+      content: 'Hello bot', timestamp: 1700000000,
     };
     global.fetch.mockResolvedValue({
       ok: true, status: 200,
@@ -1326,7 +1339,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 600, type: 'private', display_recipient: [],
       subject: '', sender_full_name: 'Bob', sender_id: 88,
-      sender_email: 'bob@example.com', content: '<p>hi</p>', timestamp: 1700000000,
+      sender_email: 'bob@example.com', content: 'hi', timestamp: 1700000000,
     };
 
     await handleInboundMessage({}, creds, account, msg, myUserId);
@@ -1351,7 +1364,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 700, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>hi</p>', timestamp: 1700000000,
+      content: 'hi', timestamp: 1700000000,
     };
 
     await handleInboundMessage({}, creds, account, msg, myUserId);
@@ -1392,7 +1405,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 760, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>Check this</p><a href="/user_uploads/1/ab/notes.txt">notes.txt</a>',
+      content: 'Check this\n[notes.txt](/user_uploads/1/ab/notes.txt)',
       timestamp: 1700000000,
     };
 
@@ -1418,7 +1431,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 770, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>see</p><a href="/user_uploads/1/cd/doc.pdf">doc.pdf</a>',
+      content: 'see\n[doc.pdf](/user_uploads/1/cd/doc.pdf)',
       timestamp: 1700000000,
     };
 
@@ -1435,7 +1448,7 @@ describe('handleInboundMessage', () => {
     const msg = {
       id: 800, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>hi</p>', timestamp: 1700000000,
+      content: 'hi', timestamp: 1700000000,
     };
 
     await handleInboundMessage({}, creds, account, msg, myUserId);
@@ -1458,13 +1471,13 @@ describe('handleInboundMessage', () => {
     const streamMsg = {
       id: 900, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'test',
       sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
-      content: '<p>hi</p>', timestamp: 1700000000,
+      content: 'hi', timestamp: 1700000000,
     };
 
     const privateMsg = {
       id: 901, type: 'private', display_recipient: [],
       subject: '', sender_full_name: 'Bob', sender_id: 88,
-      sender_email: 'bob@example.com', content: '<p>hi</p>', timestamp: 1700000000,
+      sender_email: 'bob@example.com', content: 'hi', timestamp: 1700000000,
     };
 
     function typingCalls() {

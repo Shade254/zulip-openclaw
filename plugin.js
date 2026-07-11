@@ -30,7 +30,26 @@ function getPluginRuntime() {
 
 // --- Credentials ---
 
+// Cached because credential presence gates message-tool discovery
+// (actions.describeMessageTool), which the gateway invokes for every
+// registered channel while building agent tool schemas — a hot path that
+// must not do synchronous filesystem reads per call.
+const CREDENTIALS_CACHE_TTL_MS = 30_000;
+let credentialsCache = { value: null, readAt: -Infinity };
+
+function resetCredentialsCache() {
+  credentialsCache = { value: null, readAt: -Infinity };
+}
+
 function loadCredentials() {
+  if (Date.now() - credentialsCache.readAt < CREDENTIALS_CACHE_TTL_MS) {
+    return credentialsCache.value;
+  }
+  credentialsCache = { value: readCredentialsFromDisk(), readAt: Date.now() };
+  return credentialsCache.value;
+}
+
+function readCredentialsFromDisk() {
   const secretsPath = join(homedir(), '.openclaw', 'secrets', 'zulip.env');
   if (!existsSync(secretsPath)) return null;
 
@@ -615,10 +634,10 @@ async function cleanupAttachments(maxAgeMs = 5 * 60 * 1000) {
 
 // --- Channel Plugin Definition ---
 
-// Actions exposed through OpenClaw's shared `message` tool. Kept in one place
-// so the discovery hooks (describeMessageTool / listActions) cannot drift
-// from each other.
-const MESSAGE_ACTIONS = ['send', 'react', 'reactions', 'read', 'edit', 'delete'];
+// Actions exposed through OpenClaw's shared `message` tool. Frozen because the
+// same array is handed to the gateway on every discovery call (the gateway
+// copies before use).
+const MESSAGE_ACTIONS = Object.freeze(['send', 'react', 'reactions', 'read', 'edit', 'delete']);
 
 const zulipPlugin = {
   id: 'zulip-openclaw',
@@ -745,21 +764,19 @@ const zulipPlugin = {
   },
 
   actions: {
-    // Unified message-tool discovery hook, required by OpenClaw >= 2026.6.11.
-    // The gateway calls this to learn which actions the shared `message` tool
-    // should expose for Zulip; execution still goes through handleAction.
+    // Message-tool discovery hook, required since OpenClaw 2026.3.22 (which
+    // removed the legacy listActions adapter). The gateway calls this to learn
+    // which actions the shared `message` tool should expose for Zulip;
+    // execution still goes through handleAction.
     describeMessageTool: ({ cfg }) => {
       const accounts = zulipPlugin.config.listAccountIds(cfg);
       if (accounts.length === 0) return null;
-      return { actions: [...MESSAGE_ACTIONS] };
+      return { actions: MESSAGE_ACTIONS };
     },
 
-    // Legacy discovery hook consulted by OpenClaw <= 2026.6.10.
-    listActions: ({ cfg }) => {
-      const accounts = zulipPlugin.config.listAccountIds(cfg);
-      if (accounts.length === 0) return [];
-      return [...MESSAGE_ACTIONS];
-    },
+    // Editing or deleting existing messages is privileged: the gateway only
+    // dispatches these when the requester's sender identity is trusted.
+    requiresTrustedRequesterSender: ({ action }) => action === 'edit' || action === 'delete',
 
     handleAction: async ({ action, params, cfg, accountId }) => {
       const account = zulipPlugin.config.resolveAccount(cfg, accountId);
@@ -1005,5 +1022,5 @@ module.exports = {
   // Exported for direct unit testing
   resolvePersonaForMessage, fetchThreadContext, handleInboundMessage,
   resolveAttachments, cleanupAttachments, ZULIP_ATTACHMENTS_DIR,
-  MESSAGE_ACTIONS,
+  MESSAGE_ACTIONS, resetCredentialsCache,
 };

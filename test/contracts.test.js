@@ -1,16 +1,17 @@
 /**
- * OpenClaw 2026.6.11 plugin-contract tests
+ * OpenClaw plugin-contract tests
  *
- * Guards the two registration surfaces the gateway tightened in 2026.6.11:
+ * Guards the two gateway registration surfaces this plugin depends on:
  *  1. Agent tools register only when openclaw.plugin.json declares them
- *     in contracts.tools.
- *  2. Message-action discovery calls actions.describeMessageTool(ctx)
- *     directly (the legacy listActions hook is no longer consulted).
+ *     in contracts.tools (enforced by the gateway since 2026.5.2).
+ *  2. Message-action discovery calls actions.describeMessageTool(ctx);
+ *     the legacy listActions adapter was removed in gateway 2026.3.22.
  *
  * Run with: npm test
  */
 
 const manifest = require('../openclaw.plugin.json');
+const pkg = require('../package.json');
 const register = require('../index.js');
 const { zulipPlugin, MESSAGE_ACTIONS } = require('../plugin');
 
@@ -21,8 +22,9 @@ const { zulipPlugin, MESSAGE_ACTIONS } = require('../plugin');
 describe('manifest contracts.tools', () => {
   /**
    * Runs index.js register() against a mock plugin API and captures every
-   * tool name it tries to register, the same names the gateway checks
-   * against contracts.tools.
+   * tool name it tries to register — the same names the gateway checks
+   * against contracts.tools. Mirrors the gateway's extraction (opts.names,
+   * opts.name, tool.name for non-factory tools) including its trim step.
    */
   function captureRegisteredToolNames() {
     const names = [];
@@ -36,7 +38,7 @@ describe('manifest contracts.tools', () => {
         if (typeof tool !== 'function' && tool?.name) names.push(tool.name);
       },
     });
-    return [...new Set(names)];
+    return [...new Set(names.map((name) => String(name).trim()))];
   }
 
   test('manifest declares a non-empty contracts.tools array', () => {
@@ -50,7 +52,7 @@ describe('manifest contracts.tools', () => {
   });
 
   test('every tool registered by index.js is declared in contracts.tools', () => {
-    // The 2026.6.11 gateway rejects registration of any undeclared tool with
+    // The gateway rejects registration of any undeclared tool with
     // "plugin must declare contracts.tools for: <name>".
     const declared = new Set(manifest.contracts.tools);
     for (const name of captureRegisteredToolNames()) {
@@ -65,6 +67,12 @@ describe('manifest contracts.tools', () => {
     for (const name of manifest.contracts.tools) {
       expect(registered).toContain(name);
     }
+  });
+
+  test('manifest version stays in sync with package.json', () => {
+    // The two files are hand-edited independently and drifted once before
+    // (manifest stuck at 0.1.0 while package.json moved on).
+    expect(manifest.version).toBe(pkg.version);
   });
 });
 
@@ -93,15 +101,15 @@ describe('manifest channelConfigs', () => {
     }
   });
 
-  test('zulip schema tolerates core channel fields users already set', () => {
-    // Core does not merge its shared channel options (blockStreaming,
-    // chunkMode, ...) into plugin schemas — the schema itself must accept
-    // them or real-world `channels.zulip` config would fail validation.
+  test('zulip schema stays open so core channel options validate as core defines them', () => {
+    // Declaring per-field constraints here would newly subject pre-existing
+    // `channels.zulip` values to hard config validation on upgrade (before
+    // this manifest entry existed, core skipped schema validation for the
+    // channel entirely). Keep the schema open and let core validate its own
+    // shared options (blockStreaming, chunkMode, ...) with its own bounds.
     const schema = manifest.channelConfigs.zulip.schema;
     expect(schema.additionalProperties).toBe(true);
-    for (const field of ['enabled', 'blockStreaming', 'blockStreamingCoalesce', 'chunkMode']) {
-      expect(Object.hasOwn(schema.properties, field)).toBe(true);
-    }
+    expect(schema.properties ?? {}).toEqual({});
   });
 });
 
@@ -120,9 +128,12 @@ describe('actions.describeMessageTool', () => {
     zulipPlugin.config.listAccountIds = originalListAccountIds;
   });
 
-  test('is a function (gateway calls it without a typeof guard)', () => {
-    // 2026.6.11 discovery invokes params.describeMessageTool(context)
-    // directly; a missing function surfaces as a boot-time TypeError.
+  test('is a function (missing hook silently disables message actions)', () => {
+    // Gateway discovery calls params.describeMessageTool(context) inside a
+    // try/catch: a missing function is caught and logged once as a
+    // "[message-action-discovery] ... failed" error while tool schemas are
+    // built, and Zulip's message actions silently vanish from the shared
+    // `message` tool. The gateway itself keeps running.
     expect(typeof zulipPlugin.actions.describeMessageTool).toBe('function');
   });
 
@@ -139,21 +150,22 @@ describe('actions.describeMessageTool', () => {
     });
   });
 
-  test('stays in sync with the legacy listActions hook', () => {
+  test('action list is frozen shared state (gateway copies before use)', () => {
     zulipPlugin.config.listAccountIds = jest.fn(() => ['default']);
     const described = zulipPlugin.actions.describeMessageTool({ cfg: {} });
-    const legacy = zulipPlugin.actions.listActions({ cfg: {} });
-    expect(described.actions).toEqual(legacy);
-    expect(described.actions).toEqual(MESSAGE_ACTIONS);
+    expect(described.actions).toBe(MESSAGE_ACTIONS);
+    expect(Object.isFrozen(described.actions)).toBe(true);
   });
 
-  test('returned action list is a copy, not shared mutable state', () => {
-    zulipPlugin.config.listAccountIds = jest.fn(() => ['default']);
-    const first = zulipPlugin.actions.describeMessageTool({ cfg: {} });
-    first.actions.push('poll');
-    const second = zulipPlugin.actions.describeMessageTool({ cfg: {} });
-    expect(second.actions).not.toContain('poll');
-    expect(MESSAGE_ACTIONS).not.toContain('poll');
+  test('requires a trusted requester sender for edit and delete only', () => {
+    // The gateway only enforces its requester-identity gate for actions the
+    // plugin marks via requiresTrustedRequesterSender; without it, any
+    // tool-driven caller could edit or delete Zulip messages.
+    const gate = zulipPlugin.actions.requiresTrustedRequesterSender;
+    expect(typeof gate).toBe('function');
+    for (const action of MESSAGE_ACTIONS) {
+      expect(gate({ action })).toBe(action === 'edit' || action === 'delete');
+    }
   });
 
   test('tolerates the full gateway discovery context shape', () => {
@@ -178,13 +190,48 @@ describe('actions.describeMessageTool', () => {
       actions: ['send', 'react', 'reactions', 'read', 'edit', 'delete'],
     });
   });
+});
 
-  test('every advertised action is handled by handleAction', async () => {
-    // Discovery and execution must not drift: an advertised action that
-    // handleAction rejects would surface as "Unsupported action" to users.
+// ============================================
+// advertised actions <-> handleAction parity
+// ============================================
+
+describe('advertised actions are executable', () => {
+  let originalListAccountIds;
+  let originalResolveAccount;
+  let originalFetch;
+
+  // One canned Zulip success response rich enough that every action's happy
+  // path — including the read/reactions mappers — actually executes. The
+  // second reaction has no `user` object, matching newer Zulip servers where
+  // the legacy nested user dict is deprecated in favor of user_id.
+  const zulipResponse = {
+    result: 'success',
+    id: 1,
+    messages: [
+      {
+        id: 7,
+        sender_full_name: 'Ada',
+        sender_email: 'ada@example.com',
+        content: 'hi **there**',
+        subject: 'topic-a',
+        timestamp: 1720000000,
+        reactions: [
+          { emoji_name: 'heart', user: { full_name: 'Ada' } },
+          { emoji_name: 'tada', user_id: 9 },
+        ],
+      },
+    ],
+    message: {
+      reactions: [{ emoji_name: 'heart', user: { full_name: 'Ada' } }],
+    },
+  };
+
+  beforeEach(() => {
+    originalListAccountIds = zulipPlugin.config.listAccountIds;
+    originalResolveAccount = zulipPlugin.config.resolveAccount;
+    originalFetch = global.fetch;
     zulipPlugin.config.listAccountIds = jest.fn(() => ['default']);
-    const originalResolveAccount = zulipPlugin.config.resolveAccount;
-    const originalFetch = global.fetch;
     zulipPlugin.config.resolveAccount = jest.fn(() => ({
       accountId: 'default',
       email: 'bot@example.com',
@@ -192,27 +239,91 @@ describe('actions.describeMessageTool', () => {
       site: 'https://example.zulipchat.com',
     }));
     global.fetch = jest.fn().mockResolvedValue({
-      ok: true, status: 200, headers: new Map(),
-      json: () => Promise.resolve({ result: 'success', id: 1, messages: [], message: { reactions: [] } }),
+      ok: true,
+      status: 200,
+      headers: new Map(),
+      json: () => Promise.resolve(zulipResponse),
     });
+  });
 
-    try {
-      const { actions } = zulipPlugin.actions.describeMessageTool({ cfg: {} });
-      for (const action of actions) {
-        const result = await zulipPlugin.actions.handleAction({
-          action,
-          params: {
-            to: 'stream:general', message: 'hi', topic: 't',
-            messageId: '1', emoji: 'heart', stream: 'general', content: 'hi',
-          },
-          cfg: {},
-          accountId: 'default',
-        });
-        expect(result.error ?? '').not.toContain('Unsupported action');
-      }
-    } finally {
-      zulipPlugin.config.resolveAccount = originalResolveAccount;
-      global.fetch = originalFetch;
+  afterEach(() => {
+    zulipPlugin.config.listAccountIds = originalListAccountIds;
+    zulipPlugin.config.resolveAccount = originalResolveAccount;
+    global.fetch = originalFetch;
+  });
+
+  const actionParams = {
+    to: 'stream:general',
+    message: 'hi',
+    topic: 't',
+    messageId: '1',
+    emoji: 'heart',
+    stream: 'general',
+    content: 'hi',
+  };
+
+  test('every advertised action succeeds against a healthy Zulip API', async () => {
+    // Discovery and execution must not drift: an advertised action that
+    // handleAction rejects or fumbles would surface as an error to users.
+    const { actions } = zulipPlugin.actions.describeMessageTool({ cfg: {} });
+    for (const action of actions) {
+      const result = await zulipPlugin.actions.handleAction({
+        action,
+        params: actionParams,
+        cfg: {},
+        accountId: 'default',
+      });
+      expect(result.error ?? '').not.toContain('Unsupported action');
+      expect(result.ok).toBe(true);
     }
+  });
+
+  test('edit PATCHes /messages/:id with the new content', async () => {
+    await zulipPlugin.actions.handleAction({
+      action: 'edit',
+      params: { messageId: '42', message: 'updated' },
+      cfg: {},
+      accountId: 'default',
+    });
+    const [url, opts] = global.fetch.mock.calls.at(-1);
+    expect(url).toBe('https://example.zulipchat.com/api/v1/messages/42');
+    expect(opts.method).toBe('PATCH');
+    expect(opts.body).toBe(new URLSearchParams({ content: 'updated' }).toString());
+  });
+
+  test('delete sends DELETE to /messages/:id', async () => {
+    await zulipPlugin.actions.handleAction({
+      action: 'delete',
+      params: { messageId: '42' },
+      cfg: {},
+      accountId: 'default',
+    });
+    const [url, opts] = global.fetch.mock.calls.at(-1);
+    expect(url).toBe('https://example.zulipchat.com/api/v1/messages/42');
+    expect(opts.method).toBe('DELETE');
+  });
+
+  test('read maps messages and tolerates reactions without a user object', async () => {
+    const result = await zulipPlugin.actions.handleAction({
+      action: 'read',
+      params: { stream: 'general', topic: 'topic-a' },
+      cfg: {},
+      accountId: 'default',
+    });
+    expect(result.ok).toBe(true);
+    expect(result.messages).toEqual([
+      {
+        id: '7',
+        sender: 'Ada',
+        senderEmail: 'ada@example.com',
+        content: 'hi **there**',
+        topic: 'topic-a',
+        timestamp: 1720000000,
+        reactions: [
+          { emoji: 'heart', user: 'Ada' },
+          { emoji: 'tada', user: 'unknown' },
+        ],
+      },
+    ]);
   });
 });

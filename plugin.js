@@ -464,6 +464,9 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
     sendTypingOp('stop');
   };
 
+  // State is scoped to this dispatch so identical replies to later messages are safe.
+  const blockDeliveries = new Map();
+
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: inboundCtx,
     cfg,
@@ -471,7 +474,7 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
       onReplyStart: () => startTyping(),
       onIdle: () => stopTyping(),
       onCleanup: () => stopTyping(),
-      deliver: async (payload) => {
+      deliver: async (payload, info) => {
         let replyText = typeof payload === 'string' ? payload : (payload.body ?? payload.text ?? '');
         if (!replyText) return;
 
@@ -479,12 +482,36 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
           replyText = `[${personaDisplayName}] ${replyText}`;
         }
 
+        const deliveryKey = JSON.stringify([replyType, replyTarget, replyTopic ?? null, replyText]);
+        const blockDelivery = info?.kind === 'final' && blockDeliveries.get(deliveryKey);
+        if (blockDelivery && await blockDelivery) {
+          const preview = replyText.replace(/\s+/g, ' ').slice(0, 60);
+          ctx.log?.warn?.(`[zulip] Skipping final payload already delivered as a block to ${replyTarget}/${replyTopic ?? 'dm'}: ${JSON.stringify(preview)}`);
+          return;
+        }
+
         const data = { type: replyType, to: replyTarget, content: replyText };
         if (replyTopic) data.topic = replyTopic;
 
-        const sendResult = await zulipApi(creds, '/messages', 'POST', data);
-        if (sendResult.result !== 'success') {
-          ctx.log?.error?.(`[zulip] Failed to send reply: ${sendResult.msg}`);
+        const sendAttempt = (async () => {
+          try {
+            const result = await zulipApi(creds, '/messages', 'POST', data);
+            if (result.result !== 'success') {
+              ctx.log?.error?.(`[zulip] Failed to send reply: ${result.msg}`);
+            }
+            return { success: result.result === 'success' };
+          } catch (error) {
+            return { success: false, error };
+          }
+        })();
+
+        if (info?.kind === 'block') {
+          blockDeliveries.set(deliveryKey, sendAttempt.then(({ success }) => success));
+        }
+
+        const outcome = await sendAttempt;
+        if (outcome.error) {
+          throw outcome.error;
         }
       },
       onError: (err) => {

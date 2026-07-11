@@ -1228,6 +1228,98 @@ describe('handleInboundMessage', () => {
     expect(body.get('content')).toBe('Hello back!');
   });
 
+  test('suppresses a final payload already sent successfully as a block', async () => {
+    mockFetchThreadContext();
+    const log = { warn: jest.fn() };
+    const msg = {
+      id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: '<p>Hello bot</p>', timestamp: 1700000000,
+    };
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', id: 123 }),
+    });
+
+    await handleInboundMessage({ log }, creds, account, msg, myUserId);
+    await deliverFn('Done.', { kind: 'block' });
+    await deliverFn('Done.', { kind: 'final' });
+
+    const messagePosts = global.fetch.mock.calls.filter(([, options]) =>
+      options?.method === 'POST' && String(options.body).includes('content=Done.')
+    );
+    expect(messagePosts).toHaveLength(1);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('already delivered as a block'));
+  });
+
+  test('sends the final payload when the matching block send failed', async () => {
+    mockFetchThreadContext();
+    const log = { error: jest.fn() };
+    const msg = {
+      id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: '<p>Hello bot</p>', timestamp: 1700000000,
+    };
+    global.fetch
+      .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ result: 'success', messages: [] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ result: 'error', msg: 'send failed' }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ result: 'success', id: 124 }) });
+
+    await handleInboundMessage({ log }, creds, account, msg, myUserId);
+    await deliverFn('Retry me', { kind: 'block' });
+    await deliverFn('Retry me', { kind: 'final' });
+
+    expect(global.fetch).toHaveBeenCalledTimes(3);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('send failed'));
+  });
+
+  test('waits for an in-flight matching block before sending the final payload', async () => {
+    mockFetchThreadContext();
+    const log = { warn: jest.fn() };
+    const msg = {
+      id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: '<p>Hello bot</p>', timestamp: 1700000000,
+    };
+    await handleInboundMessage({ log }, creds, account, msg, myUserId);
+    let finishBlock;
+    global.fetch.mockImplementationOnce(() => new Promise(resolve => { finishBlock = resolve; }));
+    const blockPromise = deliverFn('Slow response', { kind: 'block' });
+    const finalPromise = deliverFn('Slow response', { kind: 'final' });
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+
+    finishBlock({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', id: 126 }),
+    });
+    await Promise.all([blockPromise, finalPromise]);
+
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('already delivered as a block'));
+  });
+
+  test('does not deduplicate matching payloads unless the second is final', async () => {
+    mockFetchThreadContext();
+    const msg = {
+      id: 100, type: 'stream', stream_id: 10, display_recipient: 'general', subject: 'greetings',
+      sender_full_name: 'Alice', sender_id: 99, sender_email: 'alice@example.com',
+      content: '<p>Hello bot</p>', timestamp: 1700000000,
+    };
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ result: 'success', id: 125 }),
+    });
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+    await deliverFn('Same text', { kind: 'final' });
+    await deliverFn('Same text', { kind: 'final' });
+
+    const messagePosts = global.fetch.mock.calls.filter(([, options]) =>
+      options?.method === 'POST' && String(options.body).includes('content=Same+text')
+    );
+    expect(messagePosts).toHaveLength(2);
+  });
+
   test('deliver callback sends private reply correctly', async () => {
     mockFetchThreadContext();
 

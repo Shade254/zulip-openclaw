@@ -69,6 +69,43 @@ describe('manifest contracts.tools', () => {
 });
 
 // ============================================
+// channelConfigs metadata
+// ============================================
+
+describe('manifest channelConfigs', () => {
+  test('every declared channel has a channelConfigs entry', () => {
+    // Mirrors the gateway's manifest-registry check: channels declared
+    // without channelConfigs metadata trigger a boot warning and leave the
+    // pre-runtime config schema / setup UI surfaces blind to the channel.
+    for (const channelId of manifest.channels) {
+      expect(Object.hasOwn(manifest.channelConfigs ?? {}, channelId)).toBe(true);
+    }
+  });
+
+  test('each channelConfigs entry declares an object schema', () => {
+    for (const [channelId, entry] of Object.entries(manifest.channelConfigs)) {
+      expect(typeof entry.schema).toBe('object');
+      expect(entry.schema.type).toBe('object');
+      expect(typeof entry.label).toBe('string');
+      // channelConfigs entries also imply channel ownership in the gateway
+      // (recordOwnsChannel); do not declare channels the plugin doesn't own.
+      expect(manifest.channels).toContain(channelId);
+    }
+  });
+
+  test('zulip schema tolerates core channel fields users already set', () => {
+    // Core does not merge its shared channel options (blockStreaming,
+    // chunkMode, ...) into plugin schemas — the schema itself must accept
+    // them or real-world `channels.zulip` config would fail validation.
+    const schema = manifest.channelConfigs.zulip.schema;
+    expect(schema.additionalProperties).toBe(true);
+    for (const field of ['enabled', 'blockStreaming', 'blockStreamingCoalesce', 'chunkMode']) {
+      expect(Object.hasOwn(schema.properties, field)).toBe(true);
+    }
+  });
+});
+
+// ============================================
 // actions.describeMessageTool
 // ============================================
 

@@ -8,6 +8,53 @@
   "contracts": {
     "tools": ["zulip_send", "zulip_read", "zulip_react"]
   },
+  "channelConfigs": {
+    "zulip": {
+      "label": "Zulip",
+      "description": "Zulip team chat with topic-aware routing. Credentials live in ~/.openclaw/secrets/zulip.env, not in this config section.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Enable the Zulip channel."
+          },
+          "blockStreaming": {
+            "type": "boolean",
+            "description": "Stream agent replies to Zulip as coalesced message blocks."
+          },
+          "blockStreamingCoalesce": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "minChars": { "type": "integer", "minimum": 1 },
+              "maxChars": { "type": "integer", "minimum": 1 },
+              "idleMs": { "type": "integer", "minimum": 0 }
+            },
+            "description": "Coalescing thresholds for block streaming."
+          },
+          "chunkMode": {
+            "type": "string",
+            "enum": ["length", "newline"],
+            "description": "How long replies are split into Zulip messages."
+          },
+          "textChunkLimit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum characters per outbound Zulip message."
+          }
+        }
+      },
+      "uiHints": {
+        "enabled": { "label": "Enabled" },
+        "blockStreaming": { "label": "Block streaming", "advanced": true },
+        "blockStreamingCoalesce": { "label": "Block streaming coalescing", "advanced": true },
+        "chunkMode": { "label": "Chunk mode", "advanced": true },
+        "textChunkLimit": { "label": "Text chunk limit", "advanced": true }
+      }
+    }
+  },
   "configSchema": {
     "type": "object",
     "properties": {},

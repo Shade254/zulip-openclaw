@@ -58,6 +58,8 @@ Works on OpenClaw **2026.6.11 and later**, and remains backward compatible with 
 - **Tool ownership contract** — agent tools only register when the plugin manifest declares them upfront. `openclaw.plugin.json` lists all three tools under `contracts.tools`; if you add or rename a tool in `index.js`, update that list too (the `contracts.test.js` suite fails on any drift).
 - **Unified message-action discovery** — the gateway discovers channel actions by calling `actions.describeMessageTool(context)` and no longer consults the legacy `actions.listActions` hook. The plugin implements both, sharing one action list, so it works on either side of the 2026.6.11 boundary.
 
+The manifest also declares `channelConfigs.zulip` so the gateway's config-schema, setup, and Control UI surfaces know the channel's option shape before the plugin runtime loads (without it, the gateway logs a boot warning and the setup UI is limited). Note that `channels.zulip` only carries core channel options like `blockStreaming` — Zulip credentials live in `~/.openclaw/secrets/zulip.env`.
+
 Symptoms on 2026.6.11 without these fixes: boot-log errors `plugin must declare contracts.tools before registering agent tools` and `describeMessageTool is not a function`, with Zulip agent tools and message actions missing while the gateway otherwise stays healthy.
 
 ## Setup

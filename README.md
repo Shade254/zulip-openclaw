@@ -51,6 +51,15 @@ The plugin loads in OpenClaw and implements the core channel plugin contract (co
 
 The plugin registers as an OpenClaw channel. All messaging goes through OpenClaw's native `message` tool via `actions.handleAction`. Agent tools (`zulip_send`, `zulip_read`, `zulip_react`) are also registered for direct use.
 
+## OpenClaw compatibility
+
+Works on OpenClaw **2026.6.11 and later**, and remains backward compatible with earlier gateways. Version 2026.6.11 tightened the plugin API in two ways this plugin now satisfies:
+
+- **Tool ownership contract** — agent tools only register when the plugin manifest declares them upfront. `openclaw.plugin.json` lists all three tools under `contracts.tools`; if you add or rename a tool in `index.js`, update that list too (the `contracts.test.js` suite fails on any drift).
+- **Unified message-action discovery** — the gateway discovers channel actions by calling `actions.describeMessageTool(context)` and no longer consults the legacy `actions.listActions` hook. The plugin implements both, sharing one action list, so it works on either side of the 2026.6.11 boundary.
+
+Symptoms on 2026.6.11 without these fixes: boot-log errors `plugin must declare contracts.tools before registering agent tools` and `describeMessageTool is not a function`, with Zulip agent tools and message actions missing while the gateway otherwise stays healthy.
+
 ## Setup
 
 **Requires Node.js 18+** (for native fetch)

@@ -599,6 +599,11 @@ async function cleanupAttachments(maxAgeMs = 5 * 60 * 1000) {
 
 // --- Channel Plugin Definition ---
 
+// Actions exposed through OpenClaw's shared `message` tool. Kept in one place
+// so the discovery hooks (describeMessageTool / listActions) cannot drift
+// from each other.
+const MESSAGE_ACTIONS = ['send', 'react', 'reactions', 'read', 'edit', 'delete'];
+
 const zulipPlugin = {
   id: 'zulip-openclaw',
 
@@ -724,10 +729,20 @@ const zulipPlugin = {
   },
 
   actions: {
+    // Unified message-tool discovery hook, required by OpenClaw >= 2026.6.11.
+    // The gateway calls this to learn which actions the shared `message` tool
+    // should expose for Zulip; execution still goes through handleAction.
+    describeMessageTool: ({ cfg }) => {
+      const accounts = zulipPlugin.config.listAccountIds(cfg);
+      if (accounts.length === 0) return null;
+      return { actions: [...MESSAGE_ACTIONS] };
+    },
+
+    // Legacy discovery hook consulted by OpenClaw <= 2026.6.10.
     listActions: ({ cfg }) => {
       const accounts = zulipPlugin.config.listAccountIds(cfg);
       if (accounts.length === 0) return [];
-      return ['send', 'react', 'reactions', 'read', 'edit', 'delete'];
+      return [...MESSAGE_ACTIONS];
     },
 
     handleAction: async ({ action, params, cfg, accountId }) => {
@@ -971,4 +986,5 @@ module.exports = {
   // Exported for direct unit testing
   resolvePersonaForMessage, fetchThreadContext, handleInboundMessage,
   resolveAttachments, cleanupAttachments, ZULIP_ATTACHMENTS_DIR,
+  MESSAGE_ACTIONS,
 };

@@ -134,7 +134,9 @@ function guessMimeType(filename) {
 }
 
 function resolveMessageTarget(to, replyToId) {
-  let type = 'private';
+  // 'direct' replaced the deprecated 'private' in Zulip 7.0 (feature level
+  // 174); 'private' still works but is scheduled for eventual removal.
+  let type = 'direct';
   let target = to;
   let topic = replyToId ?? 'chat';
 
@@ -287,7 +289,8 @@ async function zulipUpload(creds, source) {
   const result = await response.json();
   if (result.result !== 'success') throw new Error(`Zulip upload failed: ${result.msg}`);
 
-  return { ok: true, uri: result.uri ?? result.url, filename };
+  // `url` is the current field name (Zulip 9.0+); `uri` is the deprecated alias.
+  return { ok: true, uri: result.url ?? result.uri, filename };
 }
 
 // --- Gateway Helpers ---
@@ -301,7 +304,17 @@ async function fetchThreadContext(creds, msg, myUserId) {
     contextNarrow.push({ operator: 'stream', operand: msg.display_recipient });
     contextNarrow.push({ operator: 'topic', operand: msg.subject });
   } else {
-    contextNarrow.push({ operator: 'dm', operand: [creds.email, msg.sender_email] });
+    // dm narrow operands must be user IDs (or one comma-separated email
+    // string) — an array of email strings is rejected by the server. The
+    // conversation is identified by the other participants; the server
+    // implicitly includes the bot itself.
+    const participantIds = (Array.isArray(msg.display_recipient) ? msg.display_recipient : [])
+      .map(u => u.id)
+      .filter(id => typeof id === 'number' && id !== myUserId);
+    contextNarrow.push({
+      operator: 'dm',
+      operand: participantIds.length > 0 ? participantIds : [msg.sender_id],
+    });
   }
 
   const contextQs = new URLSearchParams({
@@ -309,6 +322,7 @@ async function fetchThreadContext(creds, msg, myUserId) {
     num_before: String(CONTEXT_LIMIT),
     num_after: '0',
     anchor: String(msg.id),
+    apply_markdown: 'false', // raw Markdown, not rendered HTML
   }).toString();
 
   const contextResult = await zulipApi(creds, `/messages?${contextQs}`);
@@ -318,7 +332,7 @@ async function fetchThreadContext(creds, msg, myUserId) {
 
   const formatted = contextResult.messages.map(m => {
     const name = m.sender_id === myUserId ? '(bot)' : m.sender_full_name;
-    const content = m.content.replace(/<[^>]*>/g, '');
+    const content = m.content; // raw Markdown (apply_markdown=false)
     const reactions = (m.reactions ?? []).map(r => r.emoji_name);
     const reactStr = reactions.length > 0 ? ` [reacts: ${reactions.join(', ')}]` : '';
     return `[${name}] (id:${m.id}) ${content}${reactStr}`;
@@ -338,7 +352,9 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
   const from = isStream
     ? `zulip:${msg.display_recipient}`
     : `zulip:${msg.sender_id}`;
-  let text = (msg.content ?? '').replace(/<[^>]*>/g, '');
+  // Event content is raw Markdown: /register is called without
+  // apply_markdown, which defaults to false. No HTML to strip.
+  let text = msg.content ?? '';
 
   try {
     await cleanupAttachments();
@@ -804,19 +820,20 @@ const zulipPlugin = {
           num_before: String(limit),
           num_after: '0',
           anchor: 'newest',
+          apply_markdown: 'false', // raw Markdown, not rendered HTML
         };
         const qs = new URLSearchParams(queryParams).toString();
         const result = await zulipApi(creds, `/messages?${qs}`);
-        
+
         if (result.result === 'success') {
           const messages = (result.messages ?? []).reverse().map(m => ({
             id: String(m.id),
             sender: m.sender_full_name,
             senderEmail: m.sender_email,
-            content: m.content.replace(/<[^>]*>/g, ''), // strip HTML
+            content: m.content,
             topic: m.subject,
             timestamp: m.timestamp,
-            reactions: (m.reactions ?? []).map(r => ({ emoji: r.emoji_name, user: r.user.full_name })),
+            reactions: (m.reactions ?? []).map(r => ({ emoji: r.emoji_name, user: r.user?.full_name ?? 'unknown' })),
           }));
           return { ok: true, messages };
         }
@@ -903,7 +920,9 @@ const zulipPlugin = {
 
             if (result.result !== 'success') {
               consecutiveErrors++;
-              if (String(result.msg).includes('BAD_EVENT_QUEUE_ID')) {
+              // Match on `code`, not `msg`: the human-readable msg is
+              // "Bad event queue ID: <uuid>" and never contains the constant.
+              if (result.code === 'BAD_EVENT_QUEUE_ID') {
                 ctx.log?.warn?.('[zulip] Queue expired, re-registering...');
                 if (!await reRegister()) {
                   await backoff(consecutiveErrors);

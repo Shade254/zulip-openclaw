@@ -43,7 +43,7 @@ function register(api) {
           const result = await zulipApi(creds, '/messages', 'POST', data);
           return jsonResult(result.result === 'success' ? { ok: true, messageId: result.id } : { ok: false, error: result.msg });
         } else if (params.user) {
-          const data = { type: 'private', to: params.user, content: params.message };
+          const data = { type: 'direct', to: params.user, content: params.message };
           const result = await zulipApi(creds, '/messages', 'POST', data);
           return jsonResult(result.result === 'success' ? { ok: true, messageId: result.id } : { ok: false, error: result.msg });
         }
@@ -75,6 +75,7 @@ function register(api) {
           num_before: String(params.limit ?? 10),
           num_after: '0',
           anchor: 'newest',
+          apply_markdown: 'false',
         }).toString();
 
         const result = await zulipApi(creds, `/messages?${qs}`);
@@ -85,9 +86,9 @@ function register(api) {
               id: m.id,
               sender: m.sender_full_name,
               topic: m.subject,
-              content: m.content.replace(/<[^>]*>/g, ''),
+              content: m.content,
               timestamp: m.timestamp,
-              reactions: (m.reactions ?? []).map(r => ({ emoji: r.emoji_name, user: r.user.full_name })),
+              reactions: (m.reactions ?? []).map(r => ({ emoji: r.emoji_name, user: r.user?.full_name ?? 'unknown' })),
             })),
           });
         }

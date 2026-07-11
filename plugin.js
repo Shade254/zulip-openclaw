@@ -15,39 +15,6 @@ const USER_AGENT = `zulip-openclaw/${version}`;
 const MAX_UPLOAD_SIZE_MB = 25;
 const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
 
-// --- Delivery deduplication guard ---
-// Prevents the same content from being sent twice to the same target+topic
-// within a short time window. This handles the intermittent block+final
-// double-delivery race in the OpenClaw dispatch runtime.
-const DELIVER_DEDUP_TTL_MS = 10_000; // 10 second window
-const deliverDedupMap = new Map(); // key: "target|topic|contentHash" → timestamp
-
-function contentHash(text) {
-  // Fast, non-crypto hash for dedup purposes. Include length to reduce collision risk.
-  let h = 5381;
-  for (let i = 0; i < text.length; i++) {
-    h = ((h << 5) + h + text.charCodeAt(i)) | 0;
-  }
-  return `${h}:${text.length}`;
-}
-
-function isDuplicateDelivery(target, topic, content) {
-  const key = `${target}|${topic ?? ''}|${contentHash(content)}`;
-  const now = Date.now();
-  // Purge expired entries (amortized cleanup)
-  if (deliverDedupMap.size > 200) {
-    for (const [k, ts] of deliverDedupMap) {
-      if (now - ts > DELIVER_DEDUP_TTL_MS) deliverDedupMap.delete(k);
-    }
-  }
-  const existing = deliverDedupMap.get(key);
-  if (existing && (now - existing) < DELIVER_DEDUP_TTL_MS) {
-    return true; // duplicate
-  }
-  deliverDedupMap.set(key, now);
-  return false;
-}
-
 // --- Plugin Runtime (set during registration) ---
 
 let pluginRuntime = null;
@@ -497,6 +464,9 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
     sendTypingOp('stop');
   };
 
+  // State is scoped to this dispatch so identical replies to later messages are safe.
+  const blockDeliveries = new Map();
+
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: inboundCtx,
     cfg,
@@ -504,7 +474,7 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
       onReplyStart: () => startTyping(),
       onIdle: () => stopTyping(),
       onCleanup: () => stopTyping(),
-      deliver: async (payload) => {
+      deliver: async (payload, info) => {
         let replyText = typeof payload === 'string' ? payload : (payload.body ?? payload.text ?? '');
         if (!replyText) return;
 
@@ -512,18 +482,36 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
           replyText = `[${personaDisplayName}] ${replyText}`;
         }
 
-        // Guard against duplicate delivery (block+final race in dispatch runtime)
-        if (isDuplicateDelivery(replyTarget, replyTopic, replyText)) {
-          ctx.log?.warn?.(`[zulip] Skipping duplicate delivery to ${replyTarget}/${replyTopic ?? 'dm'} (${replyText.length} chars)`);
+        const deliveryKey = JSON.stringify([replyType, replyTarget, replyTopic ?? null, replyText]);
+        const blockDelivery = info?.kind === 'final' && blockDeliveries.get(deliveryKey);
+        if (blockDelivery && await blockDelivery) {
+          const preview = replyText.replace(/\s+/g, ' ').slice(0, 60);
+          ctx.log?.warn?.(`[zulip] Skipping final payload already delivered as a block to ${replyTarget}/${replyTopic ?? 'dm'}: ${JSON.stringify(preview)}`);
           return;
         }
 
         const data = { type: replyType, to: replyTarget, content: replyText };
         if (replyTopic) data.topic = replyTopic;
 
-        const sendResult = await zulipApi(creds, '/messages', 'POST', data);
-        if (sendResult.result !== 'success') {
-          ctx.log?.error?.(`[zulip] Failed to send reply: ${sendResult.msg}`);
+        const sendAttempt = (async () => {
+          try {
+            const result = await zulipApi(creds, '/messages', 'POST', data);
+            if (result.result !== 'success') {
+              ctx.log?.error?.(`[zulip] Failed to send reply: ${result.msg}`);
+            }
+            return { success: result.result === 'success' };
+          } catch (error) {
+            return { success: false, error };
+          }
+        })();
+
+        if (info?.kind === 'block') {
+          blockDeliveries.set(deliveryKey, sendAttempt.then(({ success }) => success));
+        }
+
+        const outcome = await sendAttempt;
+        if (outcome.error) {
+          throw outcome.error;
         }
       },
       onError: (err) => {

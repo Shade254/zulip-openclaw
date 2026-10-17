@@ -1093,7 +1093,7 @@ describe('handleInboundMessage', () => {
   let deliverFn;
 
   const fakeRuntime = {
-    config: { loadConfig: () => ({}) },
+    config: { current: () => ({}) },
     channel: {
       routing: {
         resolveAgentRoute: () => ({ sessionKey: 'sk-123', accountId: 'acc-1' }),
@@ -1163,6 +1163,22 @@ describe('handleInboundMessage', () => {
     expect(ctx.From).toBe('zulip:99');
     expect(ctx.ThreadId).toBeUndefined();
     expect(ctx.GroupSubject).toBeUndefined();
+  });
+
+  test('falls back to legacy config.loadConfig() on older gateways', async () => {
+    mockFetchThreadContext();
+    const loadConfig = jest.fn(() => ({}));
+    setPluginRuntime({ ...fakeRuntime, config: { loadConfig } });
+    const msg = {
+      id: 300, type: 'private', display_recipient: [{ email: 'alice@example.com' }],
+      subject: '', sender_full_name: 'Alice', sender_id: 99,
+      sender_email: 'alice@example.com', content: 'legacy', timestamp: 1700000000,
+    };
+
+    await handleInboundMessage({}, creds, account, msg, myUserId);
+
+    expect(loadConfig).toHaveBeenCalledTimes(1);
+    expect(capturedDispatchArgs.ctx.Body).toBe('legacy');
   });
 
   test('resolveAgentRoute receives channel peer for stream messages', async () => {

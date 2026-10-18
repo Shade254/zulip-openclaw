@@ -422,7 +422,12 @@ async function handleInboundMessage(ctx, creds, account, msg, myUserId) {
 
   // Dispatch through OpenClaw's inbound message system
   const runtime = getPluginRuntime();
-  const cfg = runtime.config.loadConfig();
+  // OpenClaw 2026.10 dropped runtime.config.loadConfig() (deprecated since 2026.7 as
+  // `runtime-config-load-write`); config.current() is the replacement. Keep the
+  // fallback so the plugin still runs on older gateways.
+  const cfg = typeof runtime.config.current === 'function'
+    ? runtime.config.current()
+    : runtime.config.loadConfig();
 
   const peer = isStream
     ? { kind: 'channel', id: `${msg.display_recipient}:${msg.subject}` }

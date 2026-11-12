@@ -4,7 +4,7 @@
  * Registers the Zulip channel plugin, tools, and services with OpenClaw.
  */
 
-const { zulipPlugin, loadCredentials, zulipApi, setPluginRuntime } = require('./plugin.js');
+const { zulipPlugin, loadCredentials, zulipApi, setPluginRuntime, createMessagePayload } = require('./plugin.js');
 
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -39,7 +39,7 @@ function register(api) {
         if (!creds) return jsonResult({ error: 'No Zulip credentials configured' });
 
         if (params.stream) {
-          const data = { type: 'stream', to: params.stream, content: params.message, topic: params.topic ?? 'general' };
+          const data = createMessagePayload(`stream:${params.stream}`, params.topic, params.message, creds.defaultTopic);
           const result = await zulipApi(creds, '/messages', 'POST', data);
           return jsonResult(result.result === 'success' ? { ok: true, messageId: result.id } : { ok: false, error: result.msg });
         } else if (params.user) {

@@ -69,6 +69,7 @@ The manifest also declares `channelConfigs.zulip` so the gateway's config-schema
    ZULIP_EMAIL=bot@your-org.zulipchat.com
    ZULIP_API_KEY=your-api-key
    ZULIP_SITE=https://your-org.zulipchat.com
+   ZULIP_DEFAULT_TOPIC=chat        # optional
    ```
 
 2. Add the plugin load path:
@@ -78,6 +79,24 @@ The manifest also declares `channelConfigs.zulip` so the gateway's config-schema
    ```
 
 3. Restart the gateway.
+
+## Destinations and topics
+
+| Destination | Goes to |
+|---|---|
+| `stream:general` | stream `general`, in the reply's topic or the default topic |
+| `stream:operations:topic:Job alerts` | stream `operations`, topic `Job alerts` |
+| `stream:daily:topic:{date:Europe/Copenhagen} standup` | a dated topic, e.g. `2026-11-12 standup` |
+| `private:user@example.com` | a direct message |
+
+- **Topic in the destination.** Everything after `:topic:` is the topic. It wins over the topic of the conversation being replied to. This is how a scheduled delivery or a failure alert, which carry only a destination, reaches a fixed topic:
+  ```bash
+  openclaw cron edit <job> --announce --channel zulip-openclaw --to "stream:operations:topic:Job alerts"
+  openclaw cron edit <job> --failure-alert --failure-alert-channel zulip-openclaw --failure-alert-to "stream:operations:topic:Job alerts"
+  ```
+- **Dated topics.** `{date}` in a topic becomes today's date (`YYYY-MM-DD`) in the gateway host's time zone, `{date:<IANA zone>}` in a named one. An unknown zone is an error.
+- **No topic at all.** A stream message without a topic goes to the default topic: `ZULIP_DEFAULT_TOPIC` in `zulip.env` if set, otherwise `chat`. The plugin logs a warning each time, naming the stream, so a misrouted message can be found in the gateway log.
+- **Errors.** A rejected request reports Zulip's own reason (`Zulip API error 400 on /messages: Channel 'x' does not exist`). Sends time out after 30 seconds.
 
 ## Zulip API Reference
 

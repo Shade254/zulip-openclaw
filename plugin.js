@@ -61,6 +61,7 @@ function readCredentialsFromDisk() {
     if (key === 'ZULIP_EMAIL') creds.email = value;
     if (key === 'ZULIP_API_KEY') creds.apiKey = value;
     if (key === 'ZULIP_SITE') creds.site = value;
+    if (key === 'ZULIP_DEFAULT_TOPIC' && value) creds.defaultTopic = value;
   }
   return (creds.email && creds.apiKey && creds.site) ? creds : null;
 }
@@ -152,25 +153,48 @@ function guessMimeType(filename) {
   return MIME_MAP[ext] || 'application/octet-stream';
 }
 
-function resolveMessageTarget(to, replyToId) {
-  // 'direct' replaced the deprecated 'private' in Zulip 7.0 (feature level
-  // 174); 'private' still works but is scheduled for eventual removal.
-  let type = 'direct';
-  let target = to;
-  let topic = replyToId ?? 'chat';
+const FALLBACK_TOPIC = 'chat';
+const TOPIC_SEPARATOR = ':topic:';
+const SEND_TIMEOUT_MS = 30_000;
 
-  if (to.startsWith('stream:')) {
-    type = 'stream';
-    target = to.slice(7);
-  } else if (to.startsWith('private:')) {
-    target = to.slice(8);
-  }
-
-  return { type, target, topic };
+// {date} → YYYY-MM-DD in the host's time zone, {date:Europe/Copenhagen} in a named one.
+function expandTopic(topic, now = new Date()) {
+  return topic.replace(/\{date(?::([^}]+))?\}/g, (_, timeZone) =>
+    now.toLocaleDateString('sv-SE', timeZone ? { timeZone } : undefined));
 }
 
-function createMessagePayload(to, replyToId, content) {
-  const { type, target, topic } = resolveMessageTarget(to, replyToId);
+/**
+ * Destinations: "stream:<name>", "stream:<name>:topic:<topic>", "private:<email>", or a bare email.
+ *
+ * A topic written into the destination wins over replyToId: it is what the
+ * operator asked for, and it is the only place a scheduled delivery or a
+ * failure alert can name one. With neither, the message goes to the default
+ * topic (ZULIP_DEFAULT_TOPIC, else "chat") and a warning is logged, so a
+ * misrouted message is visible in the gateway log.
+ */
+function resolveMessageTarget(to, replyToId, defaultTopic) {
+  // 'direct' replaced the deprecated 'private' in Zulip 7.0 (feature level
+  // 174); 'private' still works but is scheduled for eventual removal.
+  if (!to.startsWith('stream:')) {
+    return { type: 'direct', target: to.startsWith('private:') ? to.slice(8) : to };
+  }
+
+  let target = to.slice(7);
+  let topic = replyToId;
+  const at = target.indexOf(TOPIC_SEPARATOR);
+  if (at !== -1) {
+    topic = target.slice(at + TOPIC_SEPARATOR.length) || topic;
+    target = target.slice(0, at);
+  }
+  if (!topic) {
+    topic = defaultTopic || FALLBACK_TOPIC;
+    console.warn(`[zulip] No topic given for stream "${target}", using "${topic}". Name one in the destination: stream:${target}:topic:<topic>`);
+  }
+  return { type: 'stream', target, topic: expandTopic(String(topic)) };
+}
+
+function createMessagePayload(to, replyToId, content, defaultTopic) {
+  const { type, target, topic } = resolveMessageTarget(to, replyToId, defaultTopic);
   const data = { type, to: target, content };
   if (type === 'stream') data.topic = topic;
   return data;
@@ -235,7 +259,10 @@ async function zulipApi(creds, endpoint, method = 'GET', data, opts = {}) {
   if (!response.ok) {
     const body = await response.text();
     console.warn(`[zulip] HTTP ${response.status} on ${endpoint}: ${body.slice(0, 200)}`);
-    throw new Error(`Zulip API error ${response.status} on ${endpoint}`);
+    // Carry Zulip's own reason ("Stream 'x' does not exist") to the caller, not only to the log.
+    let reason = body.slice(0, 200);
+    try { reason = JSON.parse(body).msg || reason; } catch { /* not JSON */ }
+    throw new Error(`Zulip API error ${response.status} on ${endpoint}${reason ? `: ${reason}` : ''}`);
   }
 
   return response.json();
@@ -679,6 +706,7 @@ const zulipPlugin = {
         email: creds.email,
         apiKey: creds.apiKey,
         site: creds.site,
+        defaultTopic: creds.defaultTopic,
         enabled: true,
         config: {},
       };
@@ -705,7 +733,7 @@ const zulipPlugin = {
     },
     targetResolver: {
       looksLikeId: (input) => input.startsWith('stream:') || input.startsWith('private:') || input.includes('@'),
-      hint: '<stream:name|private:email>',
+      hint: '<stream:name|stream:name:topic:topic|private:email>',
     },
   },
 
@@ -720,9 +748,9 @@ const zulipPlugin = {
 
       const creds = { email: account.email, apiKey: account.apiKey, site: account.site };
 
-      const data = createMessagePayload(to, replyToId, text);
+      const data = createMessagePayload(to, replyToId, text, account.defaultTopic);
 
-      const result = await zulipApi(creds, '/messages', 'POST', data);
+      const result = await zulipApi(creds, '/messages', 'POST', data, { timeoutMs: SEND_TIMEOUT_MS });
 
       if (result.result === 'success') {
         return { channel: 'zulip-openclaw', ok: true, messageId: String(result.id) };
@@ -758,9 +786,9 @@ const zulipPlugin = {
       if (attachmentLinks.length > 0) parts.push(attachmentLinks.join('\n'));
       const content = parts.join('\n') || '(media)';
 
-      const data = createMessagePayload(to, replyToId, content);
+      const data = createMessagePayload(to, replyToId, content, account.defaultTopic);
 
-      const result = await zulipApi(creds, '/messages', 'POST', data);
+      const result = await zulipApi(creds, '/messages', 'POST', data, { timeoutMs: SEND_TIMEOUT_MS });
       if (result.result === 'success') {
         return { channel: 'zulip-openclaw', ok: true, messageId: String(result.id) };
       }
@@ -792,11 +820,11 @@ const zulipPlugin = {
       if (action === 'send') {
         const to = params.to ?? params.target;
         const message = params.message ?? params.content ?? '';
-        const replyToId = params.threadId ?? params.topic ?? 'chat';
+        const replyToId = params.threadId ?? params.topic;
 
-        const data = createMessagePayload(to, replyToId, message);
+        const data = createMessagePayload(to, replyToId, message, account.defaultTopic);
 
-        const result = await zulipApi(creds, '/messages', 'POST', data);
+        const result = await zulipApi(creds, '/messages', 'POST', data, { timeoutMs: SEND_TIMEOUT_MS });
         return result.result === 'success'
           ? { ok: true, messageId: String(result.id) }
           : { ok: false, error: result.msg };
@@ -1027,5 +1055,5 @@ module.exports = {
   // Exported for direct unit testing
   resolvePersonaForMessage, fetchThreadContext, handleInboundMessage,
   resolveAttachments, cleanupAttachments, ZULIP_ATTACHMENTS_DIR,
-  MESSAGE_ACTIONS, resetCredentialsCache,
+  MESSAGE_ACTIONS, resetCredentialsCache, createMessagePayload, expandTopic,
 };

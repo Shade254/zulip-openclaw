@@ -188,6 +188,23 @@ describe('Unit Tests', () => {
       expect(() => expandTopic('{date:Mars/Olympus}')).toThrow(RangeError);
     });
 
+    test('a conversation topic is never treated as a template', async () => {
+      expect((await sentTopic({ to: 'stream:general', replyToId: 'Standup {date}' })).topic).toBe('Standup {date}');
+      expect((await sentTopic({ to: 'stream:general', replyToId: 'bug {date:Foo}' })).topic).toBe('bug {date:Foo}');
+    });
+
+    test('an unknown zone in a destination topic names the template', async () => {
+      await expect(sentTopic({ to: 'stream:daily:topic:{date:Mars/Olympus} standup' }))
+        .rejects.toThrow('Invalid time zone in topic template "{date:Mars/Olympus} standup"');
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    test('the configured default topic is a template too', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      zulipPlugin.config.resolveAccount = jest.fn(() => ({ ...mockAccount, defaultTopic: '{date:Europe/Copenhagen} misc' }));
+      expect((await sentTopic({ to: 'stream:general' })).topic).toMatch(/^\d{4}-\d{2}-\d{2} misc$/);
+    });
+
     test('uses the configured default topic, and warns, when none is given', async () => {
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
       zulipPlugin.config.resolveAccount = jest.fn(() => ({ ...mockAccount, defaultTopic: 'Unsorted' }));
@@ -241,6 +258,26 @@ describe('Mock Tests', () => {
   });
 
   describe('zulipApi', () => {
+    test('a timeout names the endpoint, keeps its error name, and flags writes as possibly processed', async () => {
+      const prev = global.fetch;
+      const abort = Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+      global.fetch = jest.fn().mockRejectedValue(abort);
+      const creds = { email: 'b@x', apiKey: 'k', site: 'https://x.example' };
+      try {
+        const write = await zulipApi(creds, '/messages', 'POST', { a: 1 }, { timeoutMs: 30000 }).catch(e => e);
+        expect(write.name).toBe('TimeoutError');
+        expect(write.message).toBe('Zulip API timeout after 30s on /messages (the request may still have been processed)');
+        const read = await zulipApi(creds, '/events?queue_id=secret', 'GET', undefined, { timeoutMs: 90000 }).catch(e => e);
+        expect(read.name).toBe('TimeoutError');
+        expect(read.message).toBe('Zulip API timeout after 90s on /events');
+        const other = new Error('socket hang up');
+        global.fetch = jest.fn().mockRejectedValue(other);
+        await expect(zulipApi(creds, '/messages', 'POST', { a: 1 }, { timeoutMs: 30000 })).rejects.toBe(other);
+      } finally {
+        global.fetch = prev;
+      }
+    });
+
     test.each([
       ['plain text', 'Bad gateway', ''],
       ['HTML', '<html>Bad gateway</html>', ''],

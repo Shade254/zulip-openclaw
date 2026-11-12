@@ -166,11 +166,16 @@ function expandTopic(topic, now = new Date()) {
 /**
  * Destinations: "stream:<name>", "stream:<name>:topic:<topic>", "private:<email>", or a bare email.
  *
- * A topic written into the destination wins over replyToId: it is what the
- * operator asked for, and it is the only place a scheduled delivery or a
- * failure alert can name one. With neither, the message goes to the default
- * topic (ZULIP_DEFAULT_TOPIC, else "chat") and a warning is logged, so a
- * misrouted message is visible in the gateway log.
+ * A topic written into the destination wins over replyToId (which, despite the
+ * name from the OpenClaw outbound contract, carries the Zulip topic): it is
+ * what the operator asked for, and it is the only place a scheduled delivery
+ * or a failure alert can name one. With neither, the message goes to the
+ * default topic (ZULIP_DEFAULT_TOPIC, else "chat") and a warning is logged,
+ * so a misrouted message is visible in the gateway log.
+ *
+ * Only operator-written topics (the destination's and the configured default)
+ * are {date} templates. A conversation's own topic passes through untouched:
+ * its name belongs to whoever created it in Zulip.
  */
 function resolveMessageTarget(to, replyToId, defaultTopic) {
   // 'direct' replaced the deprecated 'private' in Zulip 7.0 (feature level
@@ -179,18 +184,28 @@ function resolveMessageTarget(to, replyToId, defaultTopic) {
     return { type: 'direct', target: to.startsWith('private:') ? to.slice(8) : to };
   }
 
+  const expandWritten = (template) => {
+    try {
+      return expandTopic(template);
+    } catch (err) {
+      throw new Error(`Invalid time zone in topic template ${JSON.stringify(template)}: ${err.message}`);
+    }
+  };
+
   let target = to.slice(7);
-  let topic = replyToId;
+  let written = '';
   const at = target.indexOf(TOPIC_SEPARATOR);
   if (at !== -1) {
-    topic = target.slice(at + TOPIC_SEPARATOR.length) || topic;
+    written = target.slice(at + TOPIC_SEPARATOR.length);
     target = target.slice(0, at);
   }
+
+  let topic = written ? expandWritten(written) : replyToId;
   if (!topic) {
-    topic = defaultTopic || FALLBACK_TOPIC;
-    console.warn(`[zulip] No topic given for stream "${target}", using "${topic}". Name one in the destination: stream:${target}:topic:<topic>`);
+    topic = expandWritten(defaultTopic || FALLBACK_TOPIC);
+    console.warn(`[zulip] No topic given for stream ${JSON.stringify(target)}, using ${JSON.stringify(topic)}. Name one in the destination: stream:<name>:topic:<topic>`);
   }
-  return { type: 'stream', target, topic: expandTopic(String(topic)) };
+  return { type: 'stream', target, topic: String(topic) };
 }
 
 function createMessagePayload(to, replyToId, content, defaultTopic) {
@@ -248,7 +263,19 @@ async function zulipApi(creds, endpoint, method = 'GET', data, opts = {}) {
     fetchOpts.signal = AbortSignal.timeout(opts.timeoutMs);
   }
 
-  const response = await fetch(url.toString(), fetchOpts);
+  let response;
+  try {
+    response = await fetch(url.toString(), fetchOpts);
+  } catch (err) {
+    if (err.name !== 'TimeoutError' || !opts.timeoutMs) throw err;
+    // Same error name (the event poller matches on it), with the endpoint and,
+    // for writes, the fact that the server may have acted before we gave up.
+    const timeout = new Error(
+      `Zulip API timeout after ${opts.timeoutMs / 1000}s on ${endpoint.split('?')[0]}` +
+      (method === 'GET' ? '' : ' (the request may still have been processed)'));
+    timeout.name = 'TimeoutError';
+    throw timeout;
+  }
 
   if (response.status === 429) {
     const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);

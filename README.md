@@ -96,9 +96,10 @@ The manifest also declares `channelConfigs.zulip` so the gateway's config-schema
   openclaw cron edit <job> --announce --channel zulip-openclaw --to "stream:operations:topic:Job alerts"
   openclaw cron edit <job> --failure-alert --failure-alert-channel zulip-openclaw --failure-alert-to "stream:operations:topic:Job alerts"
   ```
-- **Dated topics.** `{date}` in a topic becomes today's date (`YYYY-MM-DD`) in the gateway host's time zone, `{date:<IANA zone>}` in a named one. An unknown zone is an error.
+- **Dated topics.** `{date}` in a topic written into a destination (or in `ZULIP_DEFAULT_TOPIC`) becomes today's date (`YYYY-MM-DD`) in the gateway host's time zone, `{date:<IANA zone>}` in a named one. An unknown zone is an error. The topic of a conversation being replied to is never rewritten.
+- **Stream names containing `:topic:`.** Not supported: a destination `stream:a:topic:b` always means stream `a`, topic `b`, so a stream literally named `a:topic:b` would be misrouted there.
 - **No topic at all.** A stream message without a topic goes to the default topic: `ZULIP_DEFAULT_TOPIC` in `zulip.env` if set, otherwise `chat`. The plugin logs a warning each time, naming the stream, so a misrouted message can be found in the gateway log.
-- **Errors.** A rejected request reports Zulip's own reason (`Zulip API error 400 on /messages: Channel 'x' does not exist`). Sends time out after 30 seconds.
+- **Errors.** A rejected request reports Zulip's own reason (`Zulip API error 400 on /messages: Channel 'x' does not exist`). Sends time out after 30 seconds; the error says so and notes that the message may still have been delivered.
 
 ## Zulip API Reference
 

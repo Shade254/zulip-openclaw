@@ -94,7 +94,13 @@ describe('Unit Tests', () => {
   // These helpers are not exported, so we test them indirectly through
   // the exported functions that use them. However, we can test the
   // resolveMessageTarget/createMessagePayload behavior through sendText.
-  describe('message target resolution (via sendText)', () => {
+  describe.each([
+    ['sendText', args => zulipPlugin.outbound.sendText(args)],
+    ['sendMedia', args => zulipPlugin.outbound.sendMedia(args)],
+    ['send action', ({ to, text, replyToId, ...args }) => zulipPlugin.actions.handleAction({
+      action: 'send', params: { to, message: text, threadId: replyToId }, ...args,
+    })],
+  ])('message target resolution (%s)', (_, send) => {
     const originalFetch = global.fetch;
     const mockAccount = {
       accountId: 'default',
@@ -115,12 +121,13 @@ describe('Unit Tests', () => {
     });
 
     afterEach(() => {
+      jest.restoreAllMocks();
       global.fetch = originalFetch;
       zulipPlugin.config.resolveAccount = originalResolveAccount;
     });
 
     test('routes stream: prefix correctly', async () => {
-      await zulipPlugin.outbound.sendText({
+      await send({
         to: 'stream:engineering', text: 'hi', accountId: 'default', cfg: {}, replyToId: 'standup'
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
@@ -130,7 +137,7 @@ describe('Unit Tests', () => {
     });
 
     test('routes private: prefix to a direct message', async () => {
-      await zulipPlugin.outbound.sendText({
+      await send({
         to: 'private:alice@example.com', text: 'hi', accountId: 'default', cfg: {}
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
@@ -139,7 +146,7 @@ describe('Unit Tests', () => {
     });
 
     test('defaults to direct type for bare target', async () => {
-      await zulipPlugin.outbound.sendText({
+      await send({
         to: 'alice@example.com', text: 'hi', accountId: 'default', cfg: {}
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
@@ -148,7 +155,7 @@ describe('Unit Tests', () => {
     });
 
     const sentTopic = async (args) => {
-      await zulipPlugin.outbound.sendText({ text: 'hi', accountId: 'default', cfg: {}, ...args });
+      await send({ text: 'hi', accountId: 'default', cfg: {}, ...args });
       const body = new URLSearchParams(global.fetch.mock.calls.at(-1)[1].body);
       return { stream: body.get('to'), topic: body.get('topic') };
     };
@@ -186,7 +193,6 @@ describe('Unit Tests', () => {
       zulipPlugin.config.resolveAccount = jest.fn(() => ({ ...mockAccount, defaultTopic: 'Unsorted' }));
       expect((await sentTopic({ to: 'stream:general' })).topic).toBe('Unsorted');
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('No topic given for stream "general"'));
-      warn.mockRestore();
     });
 
     test('does not warn when a topic is given', async () => {
@@ -195,16 +201,18 @@ describe('Unit Tests', () => {
       await sentTopic({ to: 'stream:general', replyToId: 'y' });
       await sentTopic({ to: 'private:alice@example.com' });
       expect(warn).not.toHaveBeenCalled();
-      warn.mockRestore();
     });
 
     test('sends carry a timeout', async () => {
+      const signal = new AbortController().signal;
+      const timeout = jest.spyOn(AbortSignal, 'timeout').mockReturnValue(signal);
       await sentTopic({ to: 'stream:general:topic:x' });
-      expect(global.fetch.mock.calls.at(-1)[1].signal).toBeInstanceOf(AbortSignal);
+      expect(timeout).toHaveBeenCalledWith(30000);
+      expect(global.fetch.mock.calls.at(-1)[1].signal).toBe(signal);
     });
 
     test('uses "chat" as default topic when replyToId is missing', async () => {
-      await zulipPlugin.outbound.sendText({
+      await send({
         to: 'stream:general', text: 'hi', accountId: 'default', cfg: {}
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
@@ -228,21 +236,36 @@ describe('Mock Tests', () => {
 
   afterEach(() => {
     // Restore original fetch
+    jest.restoreAllMocks();
     global.fetch = originalFetch;
   });
 
   describe('zulipApi', () => {
+    test.each([
+      ['plain text', 'Bad gateway', ''],
+      ['HTML', '<html>Bad gateway</html>', ''],
+      ['empty body', '', ''],
+      ['missing msg', '{}', ''],
+      ['null JSON', 'null', ''],
+      ['non-string msg', '{"msg":{"error":"nope"}}', ''],
+      ['empty msg', '{"msg":""}', ''],
+      ['long msg', JSON.stringify({ msg: 'x'.repeat(300) }), ': ' + 'x'.repeat(200)],
+      ['controls in msg', JSON.stringify({ msg: 'no\n\r\t\x00\x1b\x7fpe' }), ': nope'],
+    ])('HTTP errors safely handle %s', async (_, responseBody, suffix) => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      global.fetch.mockResolvedValue({ ok: false, status: 502, text: async () => responseBody });
+      await expect(zulipApi({ email: 'b@x', apiKey: 'k', site: 'https://x.example' }, '/messages'))
+        .rejects.toEqual(new Error(`Zulip API error 502 on /messages${suffix}`));
+    });
+
     test('an HTTP error carries Zulip\'s own reason', async () => {
-      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-      const prev = global.fetch;
-      global.fetch = jest.fn().mockResolvedValue({
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      global.fetch.mockResolvedValue({
         ok: false, status: 400, headers: new Map(),
         text: () => Promise.resolve(JSON.stringify({ result: 'error', msg: "Stream 'nope' does not exist" })),
       });
       await expect(zulipApi({ email: 'b@x', apiKey: 'k', site: 'https://x.example' }, '/messages', 'POST', { a: 1 }))
         .rejects.toThrow("Zulip API error 400 on /messages: Stream 'nope' does not exist");
-      global.fetch = prev;
-      warn.mockRestore();
     });
 
     const creds = {

@@ -4,7 +4,7 @@
  * Registers the Zulip channel plugin, tools, and services with OpenClaw.
  */
 
-const { zulipPlugin, loadCredentials, zulipApi, setPluginRuntime, createMessagePayload } = require('./plugin.js');
+const { zulipPlugin, loadCredentials, zulipApi, setPluginRuntime, createMessagePayload, SEND_TIMEOUT_MS } = require('./plugin.js');
 
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -39,12 +39,15 @@ function register(api) {
         if (!creds) return jsonResult({ error: 'No Zulip credentials configured' });
 
         if (params.stream) {
+          if (params.stream.includes(':topic:')) {
+            return jsonResult({ ok: false, error: 'Stream names containing :topic: are not supported; use the topic field for the topic' });
+          }
           const data = createMessagePayload(`stream:${params.stream}`, params.topic, params.message, creds.defaultTopic);
-          const result = await zulipApi(creds, '/messages', 'POST', data);
+          const result = await zulipApi(creds, '/messages', 'POST', data, { timeoutMs: SEND_TIMEOUT_MS });
           return jsonResult(result.result === 'success' ? { ok: true, messageId: result.id } : { ok: false, error: result.msg });
         } else if (params.user) {
           const data = { type: 'direct', to: params.user, content: params.message };
-          const result = await zulipApi(creds, '/messages', 'POST', data);
+          const result = await zulipApi(creds, '/messages', 'POST', data, { timeoutMs: SEND_TIMEOUT_MS });
           return jsonResult(result.result === 'success' ? { ok: true, messageId: result.id } : { ok: false, error: result.msg });
         }
         return jsonResult({ error: 'Must specify either stream or user' });

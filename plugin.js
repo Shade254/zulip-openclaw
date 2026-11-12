@@ -260,8 +260,11 @@ async function zulipApi(creds, endpoint, method = 'GET', data, opts = {}) {
     const body = await response.text();
     console.warn(`[zulip] HTTP ${response.status} on ${endpoint}: ${body.slice(0, 200)}`);
     // Carry Zulip's own reason ("Stream 'x' does not exist") to the caller, not only to the log.
-    let reason = body.slice(0, 200);
-    try { reason = JSON.parse(body).msg || reason; } catch { /* not JSON */ }
+    let reason = '';
+    try {
+      const msg = JSON.parse(body)?.msg;
+      if (typeof msg === 'string') reason = msg.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
+    } catch { /* not JSON */ }
     throw new Error(`Zulip API error ${response.status} on ${endpoint}${reason ? `: ${reason}` : ''}`);
   }
 
@@ -1055,5 +1058,5 @@ module.exports = {
   // Exported for direct unit testing
   resolvePersonaForMessage, fetchThreadContext, handleInboundMessage,
   resolveAttachments, cleanupAttachments, ZULIP_ATTACHMENTS_DIR,
-  MESSAGE_ACTIONS, resetCredentialsCache, createMessagePayload, expandTopic,
+  MESSAGE_ACTIONS, resetCredentialsCache, createMessagePayload, expandTopic, SEND_TIMEOUT_MS,
 };

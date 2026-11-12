@@ -10,10 +10,71 @@
  * Run with: npm test
  */
 
+jest.mock('fs', () => ({
+  ...jest.requireActual('fs'),
+  existsSync: jest.fn(),
+  readFileSync: jest.fn(),
+}));
+
+const { existsSync, readFileSync } = require('fs');
 const manifest = require('../openclaw.plugin.json');
 const pkg = require('../package.json');
 const register = require('../index.js');
-const { zulipPlugin, MESSAGE_ACTIONS } = require('../plugin');
+const { zulipPlugin, MESSAGE_ACTIONS, resetCredentialsCache } = require('../plugin');
+
+describe('zulip_send execution', () => {
+  let send;
+
+  beforeEach(() => {
+    resetCredentialsCache();
+    existsSync.mockReturnValue(true);
+    readFileSync.mockReturnValue('ZULIP_EMAIL=bot@x.com\nZULIP_API_KEY=k\nZULIP_SITE=https://x.zulipchat.com\n');
+    jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true, status: 200,
+      json: async () => ({ result: 'success', id: 42 }),
+    });
+    jest.spyOn(AbortSignal, 'timeout').mockReturnValue(new AbortController().signal);
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    register({
+      logger: { info: () => {} }, runtime: null,
+      registerChannel: () => {},
+      registerTool: tool => { if (tool.name === 'zulip_send') send = tool; },
+    });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    existsSync.mockReset();
+    readFileSync.mockReset();
+    resetCredentialsCache();
+  });
+
+  test.each([
+    ['explicit topic', { stream: 'ops', topic: 'Alerts' }, '', { type: 'stream', to: 'ops', topic: 'Alerts' }],
+    ['configured default', { stream: 'ops' }, 'ZULIP_DEFAULT_TOPIC=Unsorted\n', { type: 'stream', to: 'ops', topic: 'Unsorted' }],
+    ['built-in default', { stream: 'ops' }, '', { type: 'stream', to: 'ops', topic: 'chat' }],
+    ['DM', { user: 'alice@x.com' }, '', { type: 'direct', to: 'alice@x.com' }],
+  ])('%s posts the correct payload with a 30-second timeout', async (_, params, extra, expected) => {
+    readFileSync.mockReturnValue(readFileSync() + extra);
+    const result = await send.execute('call-1', { ...params, message: 'hello' });
+    expect(JSON.parse(result.content[0].text)).toEqual({ ok: true, messageId: 42 });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    const [url, opts] = global.fetch.mock.calls[0];
+    expect(url).toBe('https://x.zulipchat.com/api/v1/messages');
+    expect(opts.method).toBe('POST');
+    expect(Object.fromEntries(new URLSearchParams(opts.body))).toEqual({ ...expected, content: 'hello' });
+    expect(AbortSignal.timeout).toHaveBeenCalledWith(30000);
+    expect(opts.signal).toBe(AbortSignal.timeout.mock.results[0].value);
+  });
+
+  test('rejects destination syntax in a stream name instead of sending to another stream', async () => {
+    const result = await send.execute('call-1', { stream: 'ops:topic:Alerts', topic: 'Explicit', message: 'hello' });
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      ok: false, error: 'Stream names containing :topic: are not supported; use the topic field for the topic',
+    });
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
 
 // ============================================
 // contracts.tools <-> registerTool consistency

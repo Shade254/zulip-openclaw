@@ -69,8 +69,10 @@ The manifest also declares `channelConfigs.zulip` so the gateway's config-schema
    ZULIP_EMAIL=bot@your-org.zulipchat.com
    ZULIP_API_KEY=your-api-key
    ZULIP_SITE=https://your-org.zulipchat.com
-   ZULIP_DEFAULT_TOPIC=chat        # optional
+   ZULIP_DEFAULT_TOPIC=chat
    ```
+
+   `ZULIP_DEFAULT_TOPIC` is optional; it defaults to `chat`.
 
 2. Add the plugin load path:
    ```bash

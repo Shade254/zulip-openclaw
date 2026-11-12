@@ -13,7 +13,7 @@ jest.mock('fs', () => ({
 }));
 
 const { existsSync, readFileSync } = require('fs');
-const { loadCredentials, resetCredentialsCache } = require('../plugin');
+const { loadCredentials, resetCredentialsCache, zulipPlugin } = require('../plugin');
 
 const SECRETS = 'ZULIP_EMAIL=bot@x.com\nZULIP_API_KEY=k\nZULIP_SITE=https://x.zulipchat.com\n';
 
@@ -48,5 +48,16 @@ describe('loadCredentials caching', () => {
     resetCredentialsCache();
     loadCredentials();
     expect(readFileSync).toHaveBeenCalledTimes(2);
+  });
+
+  test.each([
+    ['configured', 'ZULIP_DEFAULT_TOPIC=Unsorted\n', 'Unsorted'],
+    ['empty', 'ZULIP_DEFAULT_TOPIC=\n', undefined],
+    ['missing', '', undefined],
+  ])('%s default topic passes from the secrets file into the account', (_, setting, expected) => {
+    existsSync.mockReturnValue(true);
+    readFileSync.mockReturnValue(SECRETS + setting);
+    expect(loadCredentials().defaultTopic).toBe(expected);
+    expect(zulipPlugin.config.resolveAccount({}, 'default').defaultTopic).toBe(expected);
   });
 });

@@ -10,7 +10,7 @@ const os = require('os');
 const {
   zulipPlugin, zulipApi, zulipUpload, RateLimitError,
   resolvePersonaForMessage, fetchThreadContext, handleInboundMessage, setPluginRuntime,
-  resolveAttachments, cleanupAttachments, ZULIP_ATTACHMENTS_DIR,
+  resolveAttachments, cleanupAttachments, ZULIP_ATTACHMENTS_DIR, expandTopic,
 } = require('../plugin');
 
 // ============================================
@@ -94,7 +94,13 @@ describe('Unit Tests', () => {
   // These helpers are not exported, so we test them indirectly through
   // the exported functions that use them. However, we can test the
   // resolveMessageTarget/createMessagePayload behavior through sendText.
-  describe('message target resolution (via sendText)', () => {
+  describe.each([
+    ['sendText', args => zulipPlugin.outbound.sendText(args)],
+    ['sendMedia', args => zulipPlugin.outbound.sendMedia(args)],
+    ['send action', ({ to, text, replyToId, ...args }) => zulipPlugin.actions.handleAction({
+      action: 'send', params: { to, message: text, threadId: replyToId }, ...args,
+    })],
+  ])('message target resolution (%s)', (_, send) => {
     const originalFetch = global.fetch;
     const mockAccount = {
       accountId: 'default',
@@ -115,12 +121,13 @@ describe('Unit Tests', () => {
     });
 
     afterEach(() => {
+      jest.restoreAllMocks();
       global.fetch = originalFetch;
       zulipPlugin.config.resolveAccount = originalResolveAccount;
     });
 
     test('routes stream: prefix correctly', async () => {
-      await zulipPlugin.outbound.sendText({
+      await send({
         to: 'stream:engineering', text: 'hi', accountId: 'default', cfg: {}, replyToId: 'standup'
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
@@ -130,7 +137,7 @@ describe('Unit Tests', () => {
     });
 
     test('routes private: prefix to a direct message', async () => {
-      await zulipPlugin.outbound.sendText({
+      await send({
         to: 'private:alice@example.com', text: 'hi', accountId: 'default', cfg: {}
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
@@ -139,7 +146,7 @@ describe('Unit Tests', () => {
     });
 
     test('defaults to direct type for bare target', async () => {
-      await zulipPlugin.outbound.sendText({
+      await send({
         to: 'alice@example.com', text: 'hi', accountId: 'default', cfg: {}
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
@@ -147,8 +154,82 @@ describe('Unit Tests', () => {
       expect(body.get('to')).toBe('alice@example.com');
     });
 
+    const sentTopic = async (args) => {
+      await send({ text: 'hi', accountId: 'default', cfg: {}, ...args });
+      const body = new URLSearchParams(global.fetch.mock.calls.at(-1)[1].body);
+      return { stream: body.get('to'), topic: body.get('topic') };
+    };
+
+    test('reads the topic from the destination', async () => {
+      expect(await sentTopic({ to: 'stream:operations:topic:Job alerts' }))
+        .toEqual({ stream: 'operations', topic: 'Job alerts' });
+    });
+
+    test('a topic in the destination wins over replyToId', async () => {
+      expect((await sentTopic({ to: 'stream:ops:topic:Alerts', replyToId: 'other' })).topic).toBe('Alerts');
+    });
+
+    test('an empty topic in the destination falls back to replyToId', async () => {
+      expect(await sentTopic({ to: 'stream:ops:topic:', replyToId: 'standup' }))
+        .toEqual({ stream: 'ops', topic: 'standup' });
+    });
+
+    test('expands {date} in a named time zone', async () => {
+      expect(expandTopic('{date:Europe/Copenhagen} standup', new Date('2026-11-11T23:30:00Z')))
+        .toBe('2026-11-12 standup');
+      expect(expandTopic('{date:America/New_York} standup', new Date('2026-11-11T23:30:00Z')))
+        .toBe('2026-11-11 standup');
+      expect(expandTopic('{date}', new Date())).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect((await sentTopic({ to: 'stream:daily:topic:{date:Europe/Copenhagen} standup' })).topic)
+        .toMatch(/^\d{4}-\d{2}-\d{2} standup$/);
+    });
+
+    test('an unknown time zone is an error, not a wrong topic', () => {
+      expect(() => expandTopic('{date:Mars/Olympus}')).toThrow(RangeError);
+    });
+
+    test('a conversation topic is never treated as a template', async () => {
+      expect((await sentTopic({ to: 'stream:general', replyToId: 'Standup {date}' })).topic).toBe('Standup {date}');
+      expect((await sentTopic({ to: 'stream:general', replyToId: 'bug {date:Foo}' })).topic).toBe('bug {date:Foo}');
+    });
+
+    test('an unknown zone in a destination topic names the template', async () => {
+      await expect(sentTopic({ to: 'stream:daily:topic:{date:Mars/Olympus} standup' }))
+        .rejects.toThrow('Invalid time zone in topic template "{date:Mars/Olympus} standup"');
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    test('the configured default topic is a template too', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      zulipPlugin.config.resolveAccount = jest.fn(() => ({ ...mockAccount, defaultTopic: '{date:Europe/Copenhagen} misc' }));
+      expect((await sentTopic({ to: 'stream:general' })).topic).toMatch(/^\d{4}-\d{2}-\d{2} misc$/);
+    });
+
+    test('uses the configured default topic, and warns, when none is given', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      zulipPlugin.config.resolveAccount = jest.fn(() => ({ ...mockAccount, defaultTopic: 'Unsorted' }));
+      expect((await sentTopic({ to: 'stream:general' })).topic).toBe('Unsorted');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('No topic given for stream "general"'));
+    });
+
+    test('does not warn when a topic is given', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      await sentTopic({ to: 'stream:general:topic:x' });
+      await sentTopic({ to: 'stream:general', replyToId: 'y' });
+      await sentTopic({ to: 'private:alice@example.com' });
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    test('sends carry a timeout', async () => {
+      const signal = new AbortController().signal;
+      const timeout = jest.spyOn(AbortSignal, 'timeout').mockReturnValue(signal);
+      await sentTopic({ to: 'stream:general:topic:x' });
+      expect(timeout).toHaveBeenCalledWith(30000);
+      expect(global.fetch.mock.calls.at(-1)[1].signal).toBe(signal);
+    });
+
     test('uses "chat" as default topic when replyToId is missing', async () => {
-      await zulipPlugin.outbound.sendText({
+      await send({
         to: 'stream:general', text: 'hi', accountId: 'default', cfg: {}
       });
       const body = new URLSearchParams(global.fetch.mock.calls[0][1].body);
@@ -172,10 +253,58 @@ describe('Mock Tests', () => {
 
   afterEach(() => {
     // Restore original fetch
+    jest.restoreAllMocks();
     global.fetch = originalFetch;
   });
 
   describe('zulipApi', () => {
+    test('a timeout names the endpoint, keeps its error name, and flags writes as possibly processed', async () => {
+      const prev = global.fetch;
+      const abort = Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+      global.fetch = jest.fn().mockRejectedValue(abort);
+      const creds = { email: 'b@x', apiKey: 'k', site: 'https://x.example' };
+      try {
+        const write = await zulipApi(creds, '/messages', 'POST', { a: 1 }, { timeoutMs: 30000 }).catch(e => e);
+        expect(write.name).toBe('TimeoutError');
+        expect(write.message).toBe('Zulip API timeout after 30s on /messages (the request may still have been processed)');
+        const read = await zulipApi(creds, '/events?queue_id=secret', 'GET', undefined, { timeoutMs: 90000 }).catch(e => e);
+        expect(read.name).toBe('TimeoutError');
+        expect(read.message).toBe('Zulip API timeout after 90s on /events');
+        const other = new Error('socket hang up');
+        global.fetch = jest.fn().mockRejectedValue(other);
+        await expect(zulipApi(creds, '/messages', 'POST', { a: 1 }, { timeoutMs: 30000 })).rejects.toBe(other);
+      } finally {
+        global.fetch = prev;
+      }
+    });
+
+    test.each([
+      ['plain text', 'Bad gateway', ''],
+      ['HTML', '<html>Bad gateway</html>', ''],
+      ['empty body', '', ''],
+      ['missing msg', '{}', ''],
+      ['null JSON', 'null', ''],
+      ['non-string msg', '{"msg":{"error":"nope"}}', ''],
+      ['empty msg', '{"msg":""}', ''],
+      ['long msg', JSON.stringify({ msg: 'x'.repeat(300) }), ': ' + 'x'.repeat(200)],
+      ['controls in msg', JSON.stringify({ msg: 'no\n\r\t\x00\x1b\x7fpe' }), ': nope'],
+    ])('HTTP errors safely handle %s', async (_, responseBody, suffix) => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      global.fetch.mockResolvedValue({ ok: false, status: 502, text: async () => responseBody });
+      await expect(zulipApi({ email: 'b@x', apiKey: 'k', site: 'https://x.example' }, '/messages'))
+        .rejects.toEqual(new Error(`Zulip API error 502 on /messages${suffix}`));
+    });
+
+    test('an HTTP error carries Zulip\'s own reason', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      global.fetch.mockResolvedValue({
+        ok: false, status: 400, headers: new Map(),
+        text: () => Promise.resolve(JSON.stringify({ result: 'error', msg: "Stream 'nope' does not exist" })),
+      });
+      await expect(zulipApi({ email: 'b@x', apiKey: 'k', site: 'https://x.example' }, '/messages', 'POST', { a: 1 }))
+        .rejects.toThrow("Zulip API error 400 on /messages: Stream 'nope' does not exist");
+    });
+
     const creds = {
       email: 'bot@example.com',
       apiKey: 'test-api-key',
